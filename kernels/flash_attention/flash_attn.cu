@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // ---------------------------------------------------------------------------
 // Platform portability
@@ -140,6 +141,19 @@ static void check(cudaError_t err, const char* msg)
     }
 }
 
+// Dynamic shared memory above 48 KiB requires an explicit opt-in per kernel
+// (true on all compute capability 7.0+ devices); without it, the launch
+// silently fails and every thread block does nothing.
+static void configure_smem(size_t smem_bytes)
+{
+    if (smem_bytes > 48 * 1024) {
+        check(cudaFuncSetAttribute(flash_attn_kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int)smem_bytes),
+              "set max dynamic shared memory");
+    }
+}
+
 static float* read_binary(const char* path, size_t n)
 {
     FILE* f = fopen(path, "rb");
@@ -163,10 +177,99 @@ static void write_binary(const char* path, const float* buf, size_t n)
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark mode: GPU-side timing via cudaEvent, warmup + median over N runs.
+// Usage: ./flash_attn --bench <seq_len> <head_dim> [warmup=10] [iters=50]
+// Prints: BENCH_MS <median>
+// ---------------------------------------------------------------------------
+static int cmp_float(const void* a, const void* b)
+{
+    float fa = *(const float*)a, fb = *(const float*)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static int run_benchmark(int argc, char* argv[])
+{
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s --bench <seq_len> <head_dim> [warmup=10] [iters=50]\n", argv[0]);
+        return 1;
+    }
+    int seq_len  = atoi(argv[2]);
+    int head_dim = atoi(argv[3]);
+    int warmup   = (argc > 4) ? atoi(argv[4]) : 10;
+    int iters    = (argc > 5) ? atoi(argv[5]) : 50;
+
+    if (head_dim > MAX_HEAD_DIM) {
+        fprintf(stderr, "head_dim %d > MAX_HEAD_DIM %d\n", head_dim, MAX_HEAD_DIM);
+        return 1;
+    }
+
+    const size_t n     = (size_t)seq_len * head_dim;
+    const size_t sz    = n * sizeof(float);
+    const float  scale = 1.0f / sqrtf((float)head_dim);
+
+    float* hQ = (float*)malloc(sz);
+    float* hK = (float*)malloc(sz);
+    float* hV = (float*)malloc(sz);
+    srand(42);
+    for (size_t i = 0; i < n; ++i) hQ[i] = (float)rand() / RAND_MAX;
+    for (size_t i = 0; i < n; ++i) hK[i] = (float)rand() / RAND_MAX;
+    for (size_t i = 0; i < n; ++i) hV[i] = (float)rand() / RAND_MAX;
+
+    float *dQ, *dK, *dV, *dO;
+    check(cudaMalloc(&dQ, sz), "malloc Q");
+    check(cudaMalloc(&dK, sz), "malloc K");
+    check(cudaMalloc(&dV, sz), "malloc V");
+    check(cudaMalloc(&dO, sz), "malloc O");
+    check(cudaMemcpy(dQ, hQ, sz, cudaMemcpyHostToDevice), "copy Q");
+    check(cudaMemcpy(dK, hK, sz, cudaMemcpyHostToDevice), "copy K");
+    check(cudaMemcpy(dV, hV, sz, cudaMemcpyHostToDevice), "copy V");
+
+    dim3   block(BLOCK_SIZE);
+    dim3   grid((seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    size_t smem_bytes = 2 * BLOCK_SIZE * head_dim * sizeof(float);
+    configure_smem(smem_bytes);
+
+    for (int i = 0; i < warmup; ++i) {
+        flash_attn_kernel<<<grid, block, smem_bytes>>>(dQ, dK, dV, dO, seq_len, head_dim, scale);
+        check(cudaGetLastError(), "warmup kernel launch");
+    }
+    check(cudaDeviceSynchronize(), "warmup sync");
+
+    cudaEvent_t start, stop;
+    check(cudaEventCreate(&start), "event create start");
+    check(cudaEventCreate(&stop), "event create stop");
+
+    float* times = (float*)malloc(iters * sizeof(float));
+    for (int i = 0; i < iters; ++i) {
+        check(cudaEventRecord(start), "record start");
+        flash_attn_kernel<<<grid, block, smem_bytes>>>(dQ, dK, dV, dO, seq_len, head_dim, scale);
+        check(cudaGetLastError(), "timed kernel launch");
+        check(cudaEventRecord(stop), "record stop");
+        check(cudaEventSynchronize(stop), "sync stop");
+        check(cudaEventElapsedTime(&times[i], start, stop), "elapsed");
+    }
+
+    qsort(times, iters, sizeof(float), cmp_float);
+    float median = (iters % 2 == 0)
+        ? 0.5f * (times[iters / 2 - 1] + times[iters / 2])
+        : times[iters / 2];
+
+    printf("BENCH_MS %.6f\n", median);
+
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+    free(hQ); free(hK); free(hV); free(times);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[])
 {
+    if (argc >= 2 && strcmp(argv[1], "--bench") == 0)
+        return run_benchmark(argc, argv);
+
     if (argc != 7) {
         fprintf(stderr,
             "Usage: %s <seq_len> <head_dim> <Q.bin> <K.bin> <V.bin> <O.bin>\n"
@@ -207,6 +310,7 @@ int main(int argc, char* argv[])
     dim3  block(BLOCK_SIZE);
     dim3  grid((seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
     size_t smem_bytes = 2 * BLOCK_SIZE * head_dim * sizeof(float);
+    configure_smem(smem_bytes);
 
     flash_attn_kernel<<<grid, block, smem_bytes>>>(dQ, dK, dV, dO, seq_len, head_dim, scale);
     check(cudaGetLastError(), "kernel launch");

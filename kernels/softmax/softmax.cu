@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // ---------------------------------------------------------------------------
 // Platform portability
@@ -120,10 +121,83 @@ static void write_binary(const char* path, const float* buf, size_t n)
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark mode: GPU-side timing via cudaEvent, warmup + median over N runs.
+// Usage: ./softmax --bench <M> <N> [warmup=10] [iters=50]
+// Prints: BENCH_MS <median>
+// ---------------------------------------------------------------------------
+static int cmp_float(const void* a, const void* b)
+{
+    float fa = *(const float*)a, fb = *(const float*)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static int run_benchmark(int argc, char* argv[])
+{
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s --bench <M> <N> [warmup=10] [iters=50]\n", argv[0]);
+        return 1;
+    }
+    int M      = atoi(argv[2]);
+    int N      = atoi(argv[3]);
+    int warmup = (argc > 4) ? atoi(argv[4]) : 10;
+    int iters  = (argc > 5) ? atoi(argv[5]) : 50;
+
+    size_t sz = (size_t)M * N * sizeof(float);
+
+    float* hX = (float*)malloc(sz);
+    srand(42);
+    for (size_t i = 0; i < (size_t)M * N; ++i) hX[i] = (float)rand() / RAND_MAX;
+
+    float *dX, *dY;
+    check(cudaMalloc(&dX, sz), "malloc X");
+    check(cudaMalloc(&dY, sz), "malloc Y");
+    check(cudaMemcpy(dX, hX, sz, cudaMemcpyHostToDevice), "copy X");
+
+    dim3 block(BLOCK_SIZE);
+    dim3 grid(M);
+    size_t smem_bytes = BLOCK_SIZE * sizeof(float);
+
+    for (int i = 0; i < warmup; ++i) {
+        softmax_kernel<<<grid, block, smem_bytes>>>(dX, dY, M, N);
+        check(cudaGetLastError(), "warmup kernel launch");
+    }
+    check(cudaDeviceSynchronize(), "warmup sync");
+
+    cudaEvent_t start, stop;
+    check(cudaEventCreate(&start), "event create start");
+    check(cudaEventCreate(&stop), "event create stop");
+
+    float* times = (float*)malloc(iters * sizeof(float));
+    for (int i = 0; i < iters; ++i) {
+        check(cudaEventRecord(start), "record start");
+        softmax_kernel<<<grid, block, smem_bytes>>>(dX, dY, M, N);
+        check(cudaGetLastError(), "timed kernel launch");
+        check(cudaEventRecord(stop), "record stop");
+        check(cudaEventSynchronize(stop), "sync stop");
+        check(cudaEventElapsedTime(&times[i], start, stop), "elapsed");
+    }
+
+    qsort(times, iters, sizeof(float), cmp_float);
+    float median = (iters % 2 == 0)
+        ? 0.5f * (times[iters / 2 - 1] + times[iters / 2])
+        : times[iters / 2];
+
+    printf("BENCH_MS %.6f\n", median);
+
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+    cudaFree(dX); cudaFree(dY);
+    free(hX); free(times);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[])
 {
+    if (argc >= 2 && strcmp(argv[1], "--bench") == 0)
+        return run_benchmark(argc, argv);
+
     if (argc != 5) {
         fprintf(stderr,
             "Usage: %s <M> <N> <file_in> <file_out>\n"
