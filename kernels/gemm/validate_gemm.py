@@ -94,4 +94,4 @@ if __name__ == "__main__":
 
     M, K, N = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
     ok = validate(M, K, N)
-    sys.exit(0 if ok is None or not ok else 0)
+    sys.exit(0 if ok is None or ok else 1)
