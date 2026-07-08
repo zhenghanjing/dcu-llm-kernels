@@ -37,12 +37,38 @@
   constexpr int WARP_SIZE = 32;   // NVIDIA CUDA
 #endif
 
-constexpr int BLOCK_SIZE   = 64;   // Br = Bc; must be a power of 2
-constexpr int MAX_HEAD_DIM = 128;  // runtime head_dim must satisfy d <= MAX_HEAD_DIM
+constexpr int BLOCK_SIZE    = 64;    // Br = Bc; must be a power of 2
+constexpr int MAX_HEAD_DIM  = 128;   // runtime head_dim must satisfy d <= MAX_HEAD_DIM
 
 // ---------------------------------------------------------------------------
 // Kernel
 // ---------------------------------------------------------------------------
+constexpr int VEC = 4;   // vector width for float4 tile loads
+
+// Two "amortize the K/V tile load over more query rows" experiments were
+// tried here and both measurably REGRESSED performance (see dcu_perf.md
+// methodology: test, don't assume — this is the negative-result case):
+//
+//  1. Register blocking: give each thread TM=4 query rows instead of 1 (the
+//     GEMM-style TMxTN micro-tile idea). 4-5x SLOWER everywhere. Unlike GEMM,
+//     where a thread's TM/TN registers are what make reuse possible at all,
+//     here q[MAX_HEAD_DIM]+o[MAX_HEAD_DIM] per row already spills to local
+//     memory (128+128 floats vastly exceeds the ~255-register budget).
+//     Quadrupling that already-spilling footprint AND cutting grid.x (the
+//     parallelism available to hide the resulting local-memory latency) by
+//     the same 4x was a double cost with no compensating win.
+//  2. Growing BLOCK_SIZE itself (e.g. 64->128) at runtime based on the
+//     device's shared-memory budget: also SLOWER (up to ~3x). Reason this
+//     time: growing BLOCK_SIZE shrinks grid.x just like TM did (e.g.
+//     seq_len=100 dropped from 2 blocks to 1). For the seq_len values that
+//     matter here (100-4096), grid-level parallelism — having enough
+//     independent blocks to fill this GPU's ~170 SMs — is already the
+//     scarce resource, unlike GEMM's large/extreme shapes where plenty of
+//     blocks remained after tiling up. Cutting block count backfires here
+//     even with zero added per-thread register pressure.
+//
+// Net: BLOCK_SIZE=64 (unchanged from the original) plus the float4 tile-load
+// vectorization above is the best validated configuration for this kernel.
 __global__ void flash_attn_kernel(
     const float* __restrict__ Q,    // [seq_len, d]
     const float* __restrict__ K,    // [seq_len, d]
@@ -50,8 +76,11 @@ __global__ void flash_attn_kernel(
     float*       __restrict__ O,    // [seq_len, d]
     int seq_len, int d, float scale)
 {
-    // Shared memory layout: [sK | sV], each BLOCK_SIZE * d floats
-    extern __shared__ float smem[];
+    // Shared memory layout: [sK | sV], each BLOCK_SIZE * d floats.
+    // __align__(16): base must be 16B-aligned for the float4 tile loads below
+    // (a plain extern float[] only guarantees 4B alignment). BLOCK_SIZE*d is
+    // always a multiple of 4 (BLOCK_SIZE=64), so sV's offset stays aligned too.
+    extern __shared__ __align__(16) float smem[];
     float* sK = smem;
     float* sV = smem + BLOCK_SIZE * d;
 
@@ -78,12 +107,33 @@ __global__ void flash_attn_kernel(
         const int valid_kv = min(BLOCK_SIZE, seq_len - kv_start);
 
         // --- Cooperative tile load: all threads load sK and sV ---
-        // Access pattern: consecutive threads → consecutive columns → coalesced.
-        for (int elem = tid; elem < BLOCK_SIZE * d; elem += BLOCK_SIZE) {
-            const int row = elem / d, col = elem % d;
-            const int grow = kv_start + row;
-            sK[elem] = (grow < seq_len) ? K[grow * d + col] : 0.0f;
-            sV[elem] = (grow < seq_len) ? V[grow * d + col] : 0.0f;
+        // Fast path: whole tile in-bounds (no row past seq_len) and d is a
+        // multiple of 4 -> vectorized float4 loads. Otherwise (last, partial
+        // kv-tile, or unaligned d) fall back to the original scalar path;
+        // a float4 read of K[r*d+c] is only guaranteed 16B-aligned when the
+        // row stride d itself is a multiple of 4 elements.
+        const bool d_aligned    = (d % VEC == 0);
+        const bool kv_tile_full = (kv_start + BLOCK_SIZE - 1) < seq_len;
+
+        if (d_aligned && kv_tile_full) {
+            const int total_vec = (BLOCK_SIZE * d) / VEC;
+            for (int v = tid; v < total_vec; v += BLOCK_SIZE) {
+                const int row  = (v * VEC) / d;
+                const int col0 = (v * VEC) % d;
+                const int grow = kv_start + row;
+                *reinterpret_cast<float4*>(&sK[row * d + col0]) =
+                    *reinterpret_cast<const float4*>(&K[(size_t)grow * d + col0]);
+                *reinterpret_cast<float4*>(&sV[row * d + col0]) =
+                    *reinterpret_cast<const float4*>(&V[(size_t)grow * d + col0]);
+            }
+        } else {
+            // Access pattern: consecutive threads → consecutive columns → coalesced.
+            for (int elem = tid; elem < BLOCK_SIZE * d; elem += BLOCK_SIZE) {
+                const int row = elem / d, col = elem % d;
+                const int grow = kv_start + row;
+                sK[elem] = (grow < seq_len) ? K[grow * d + col] : 0.0f;
+                sV[elem] = (grow < seq_len) ? V[grow * d + col] : 0.0f;
+            }
         }
         __syncthreads();  // tiles ready
 
@@ -226,7 +276,7 @@ static int run_benchmark(int argc, char* argv[])
 
     dim3   block(BLOCK_SIZE);
     dim3   grid((seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    size_t smem_bytes = 2 * BLOCK_SIZE * head_dim * sizeof(float);
+    size_t smem_bytes = 2ull * BLOCK_SIZE * head_dim * sizeof(float);
     configure_smem(smem_bytes);
 
     for (int i = 0; i < warmup; ++i) {
@@ -309,7 +359,7 @@ int main(int argc, char* argv[])
 
     dim3  block(BLOCK_SIZE);
     dim3  grid((seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    size_t smem_bytes = 2 * BLOCK_SIZE * head_dim * sizeof(float);
+    size_t smem_bytes = 2ull * BLOCK_SIZE * head_dim * sizeof(float);
     configure_smem(smem_bytes);
 
     flash_attn_kernel<<<grid, block, smem_bytes>>>(dQ, dK, dV, dO, seq_len, head_dim, scale);

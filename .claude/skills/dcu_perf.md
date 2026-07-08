@@ -1,6 +1,6 @@
 ---
 name: dcu-perf
-description: DCU/CUDA kernel 性能优化方法论 —— 如何判断瓶颈优先级、寄存器分块、bank conflict 的实测验证、已知的规模相关 trade-off，以及每次改动后的验证纪律。优化 GEMM/softmax/flash attention 等算子前应参考本文档。
+description: DCU/CUDA kernel 性能优化方法论 —— 如何判断瓶颈优先级、寄存器分块、bank conflict 的实测验证、grid 并行度是否受限的判断方法、已知的规模相关 trade-off，以及每次改动后的验证纪律。优化 GEMM/softmax/flash attention 等算子前应参考本文档。
 ---
 
 # DCU/CUDA 性能优化经验
@@ -115,7 +115,64 @@ benchmark 好看而隐藏另一个场景的回归。如果需要同时兼顾大�
 独立需求（大小规模自适应派发多个 kernel 变体）明确提出，而不是默默塞进
 "单一改动"的优化步骤里。
 
-## 5. 验证纪律：每次改动后必须同时跑两个脚本
+## 5. grid 并行度 vs 每线程复用：如何判断哪个更稀缺
+
+**教训**：寄存器分块（第 2 条）的本质是"用更多每线程工作量换取每次访存的
+复用次数"，但这笔交易只有在 **block 数量本来就远超 GPU 的 SM 数**时才划算
+——如果 block 数量本来就不多，让每个线程做更多工作只会进一步压缩 block
+数量，把"并行度受限"的问题变得更严重，而不是缓解"复用受限"的问题。这两种
+瓶颈需要相反的对策，用错方向会让优化反而变成劣化。
+
+**GEMM 场景**：大尺寸问题下 block 数天然充足，可以放心用寄存器分块换复用。
+`kernels/gemm/gemm.cu` 用 BM=BN=64 分块后，grid 大小：
+
+| shape                 | grid 大小        | vs 本机 170 个 SM |
+|------------------------|------------------|-------------------|
+| GEMM (1024,1024,1024) | 16×16 = 256 block | ~1.5x（略有富余） |
+| GEMM (4096,4096,4096) | 64×64 = 4096 block| ~24x（明显富余）  |
+
+寄存器分块后大尺寸提速约 2 倍（见第 2 条），代价是小尺寸 (100,300,200) 的
+grid 只有 4×2=8 block，远小于 170——这正是第 4 条记录的、GEMM 自己在小
+尺寸上也会踩的同一个坑，只是大尺寸场景下 block 数够多，能把这笔交易的
+代价"稀释"到可以忽略。
+
+**FlashAttn 场景**：即使是"large / extreme"档位，`seq_len` 对应的
+`grid.x` 也可能远小于 SM 数，这时增加每线程工作量（无论是让每个线程多算
+几行，还是把 tile/BLOCK_SIZE 调大）都会因为并行度不足而适得其反。
+`kernels/flash_attention/flash_attn.cu` 用 `grid.x = ceil(seq_len/64)`：
+
+| shape (seq_len,d)     | grid.x         | vs 本机 170 个 SM        |
+|------------------------|----------------|---------------------------|
+| FlashAttn (100,64)    | ceil(100/64)=2 | ~85x **不足**             |
+| FlashAttn (512,64)    | ceil(512/64)=8 | ~21x **不足**             |
+| FlashAttn (4096,128)  | ceil(4096/64)=64| ~2.7x **不足**（extreme 档也不够！）|
+
+三档全部远低于 SM 数——注意即使是"extreme"档 (4096,128)，64 个 block 也
+比 170 个 SM 少。这个仓库在这个 kernel 上做了两次寄存器分块方向的尝试
+（每线程算 4 行、把 BLOCK_SIZE 从 64 提到 128/256），两次都让 grid.x 进一步
+减半到 1/4，实测双双变慢 3~5 倍——不是实现细节的问题，而是从一开始就选错
+了优化方向：这个 kernel 是"并行度受限"，不是"复用受限"。详见
+`flash_attn.cu` 里保留的失败实验注释。
+
+**判断方法**：优化前先算一次 `grid.x (× grid.y × grid.z)` vs GPU 的 SM 数
+（`torch.cuda.get_device_properties(0).multi_processor_count`，本机
+RTX 5090 为 170），不需要跑 benchmark 就能提前判断方向：
+
+- 如果 grid 大小**远大于** SM 数（如 GEMM 大尺寸的 24x 富余）：这个 kernel
+  是"复用受限"，可以放心用寄存器分块（第 2 条）换计算访存比。
+- 如果 grid 大小**接近或小于** SM 数（如 FlashAttn 全部三档）：这个 kernel
+  是"并行度受限"，寄存器分块只会让 block 数进一步变少，方向错误。应该优先
+  考虑**增加 block 数量**的思路，例如按 kv/reduction 维度切分出更多独立
+  block（每个 block 处理一部分 kv-tile，配合 atomic 或两阶段规约合并部分
+  结果），而不是让每个线程做更多事。这个仓库目前还没有实现这个方向，留作
+  后续优化 FlashAttn 的候选方案。
+
+**方法论**：grid 大小 vs SM 数的核算应该在写代码之前做，不要等 benchmark
+跑出回归了才倒推原因——本仓库在 FlashAttn 上就是先实现两版寄存器分块变体、
+测出回归后才做这个核算，如果提前算过 grid.x=2/8/64 vs 170 个 SM，两次尝试
+都可以省下来。
+
+## 6. 验证纪律：每次改动后必须同时跑两个脚本
 
 **硬性要求**：每做一次性能改动（哪怕只改一个 tile 参数），必须同时跑：
 
@@ -134,7 +191,10 @@ stress_test 会让"看起来没退步但其实没有变快甚至变慢"的改动
 
 ## 参考实现
 
-- 三轮优化后的最终实现：[kernels/gemm/gemm.cu](../../kernels/gemm/gemm.cu)
+- GEMM 三轮优化后的最终实现（复用受限案例）：
+  [kernels/gemm/gemm.cu](../../kernels/gemm/gemm.cu)
+- FlashAttn 优化实现，含两次失败的寄存器分块实验注释（并行度受限案例）：
+  [kernels/flash_attention/flash_attn.cu](../../kernels/flash_attention/flash_attn.cu)
 - 正确性验证：[tests/stress_test.py](../../tests/stress_test.py)、
   [kernels/gemm/validate_gemm.py](../../kernels/gemm/validate_gemm.py)
 - 性能基准（含 GPU-side cudaEvent 计时、PyTorch 对照）：
