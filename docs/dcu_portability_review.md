@@ -28,13 +28,35 @@ AMD/HCC 后端时，是否会自动让 `cuda*`（而不是 `hip*`）这些名字
 条 warpSize/bank conflict 问题都致命。这条风险贯穿检查项 5、6，作为独立发
 现列在表格最前面。
 
+> **[真机验证更新]** 已在 DTK 22.10.1 / gfx906 上确认，分三点：
+>
+> 1. 确实需要显式 `#include <hip/hip_runtime.h>`——不加的话，包括
+>    `float4` 在内的所有符号都无法解析。hipcc 不会像 nvcc 那样为 `.cu`
+>    文件隐式注入任何头文件。
+> 2. 即使加了这个 include，`cuda*` 符号也**不会**被自动映射成 `hip*`——
+>    `cudaError_t`/`cudaMalloc`/`cudaSuccess`/`cudaFree`/
+>    `cudaGetErrorString` 等在真机编译时全部报"未声明"，编译器提示应改用
+>    对应的 `hip*` 名字，需要手写符号映射。
+> 3. 用来判断"该不该 include hip_runtime.h"的条件编译宏，最初尝试的
+>    `__HIP_PLATFORM_HCC__`（以及后来怀疑的新名字 `__HIP_PLATFORM_AMD__`）
+>    **都不能用**——这两个宏是 `hip_runtime.h` **自己在被 include 之后才
+>    定义出来的**，用它们来判断"要不要 include 这个头文件"是先有鸡还是
+>    先有蛋的死循环，永远不会触发，会静默落到 `#else`（CUDA）分支，导致
+>    尝试 include 一个 HIP 环境下不存在的 `cuda_runtime.h`。正确做法是用
+>    **`__HIPCC__`**——这是 hipcc **编译器驱动本身**预定义的宏（类似 nvcc
+>    的 `__CUDACC__`），在任何头文件被处理之前就已经确定，不存在这个先后
+>    顺序问题。
+>
+> 以上三点已在 `kernels/common/gpu_compat.h` 中落地，并在真机验证通过
+> （见下方"真机验证记录"一节）。
+
 ---
 
 ## 审查结果汇总表（按风险等级降序）
 
 | 文件:行号 | 问题描述 | 风险等级 | 当前处理方式 | 建议动作 |
 |---|---|---|---|---|
-| **gemm.cu 全文件**（如 182,249-253,260-275,285-287,322-336,347）<br>**softmax.cu 全文件**（如 93-99,152-177,219-231）<br>**flash_attn.cu 全文件**（如 186-192,269-311,349-367,377） | 所有 `cuda*` API（Malloc/Memcpy/Free/Event*/GetLastError/DeviceSynchronize/Memset 等）都是字面量直写，**没有任何 `#include <hip/hip_runtime.h>`、没有 `#ifdef __HIP_PLATFORM_HCC__` 分支、没有统一的 CHECK_CUDA/CHECK_HIP 宏**。三个文件各自维护一份重复的 `check()` 辅助函数（gemm.cu:182、softmax.cu:93、flash_attn.cu:186），均以 `cudaError_t`/`cudaSuccess`/`cudaGetErrorString` 为参数。 | **高** | 只有 CUDA 分支，无 HIP 分支；甚至没有 CUDA 分支的显式 include（隐式依赖 nvcc 注入） | 见下方"建议 1" |
+| **gemm.cu 全文件**（如 182,249-253,260-275,285-287,322-336,347）<br>**softmax.cu 全文件**（如 93-99,152-177,219-231）<br>**flash_attn.cu 全文件**（如 186-192,269-311,349-367,377） | 所有 `cuda*` API（Malloc/Memcpy/Free/Event*/GetLastError/DeviceSynchronize/Memset 等）都是字面量直写。三个文件各自维护一份重复的 `check()` 辅助函数（gemm.cu:182、softmax.cu:93、flash_attn.cu:186），均以 `cudaError_t`/`cudaSuccess`/`cudaGetErrorString` 为参数。 | **已解决** | 三个文件顶部各加一行 `#include "../common/gpu_compat.h"`；该头文件用 `#ifdef __HIPCC__` 路由，在 HIP 路径下 `#include <hip/hip_runtime.h>` 并把三个文件实际用到的全部 19 个 `cuda*` 符号 `#define` 成对应的 `hip*` 名字，CUDA 路径下改成显式 `#include <cuda_runtime.h>`（原来隐式依赖 nvcc 注入）。方案细节见下方"建议 1"（已更新为真机验证过的最终版本） | GEMM 已在真机 (gfx906, DTK 22.10.1) 验证**编译 + 运行成功**，double 累加器精度结果与本地 CUDA bit-for-bit 一致，见下方"真机验证记录"。softmax.cu / flash_attn.cu 引用同一份 `gpu_compat.h`，理论上应同样生效，但**尚未在真机上单独跑通**，建议后续补验证 |
 | flash_attn.cu:197-205 | `configure_smem()`：`cudaFuncSetAttribute(flash_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`，且触发阈值硬编码为 NVIDIA Volta+ 专属的 `48*1024` 字节 | **高** | 只有 CUDA 分支，无 HIP 分支 | 见下方"建议 2"；另外这里有个**容量风险**：extreme 档 (seq_len=4096, head_dim=128) 需要 `2×64×128×4=65536` 字节（恰好 64 KiB），如果 gfx906 每个 workgroup 的 LDS 总预算就是 64 KiB（无 NVIDIA 式的"48KiB默认+opt-in"分层），这个 shape 在 DCU 上可能连启动都启动不了，需要真机验证后决定是否要降低 BLOCK_SIZE |
 | tests/stress_test.py:126<br>tests/benchmark.py:111 | `cmd = ["nvcc", "-O2", "-arch=sm_120", "-o", out_base, SRC[op]]`，硬编码 nvcc 可执行名和 CUDA 专属架构标志 `-arch=sm_120`（本机 RTX 5090 的 compute capability，对其他 CUDA 卡也不通用，更不用说 DCU） | **高** | 只识别 nvcc，无 hipcc 分支/检测逻辑 | 见下方"建议 3" |
 | gemm.cu:37-51（注释） | Bank conflict 分析（B-fragment `sB[kk][threadIdx.x*TN]` 的 2-way 冲突）是按 **32 个 bank + 32 线程一个 warp** 推导的。AMD gfx906 的 LDS 同样是 32 bank（这点历史上和 NVIDIA 一致），但 **wavefront 是 64 而不是 32**——同一条 shared memory 指令里竞争这 8 个不冲突槽位的线程数会翻倍（16 个不同地址 × 2 份 wavefront-内重复，而不是 warp 情形下的 1 份），结论很可能从"2-way 冲突"恶化成"4-way 冲突"，而不是保持不变 | **中**（不影响正确性，但 dcu_perf.md 里记录的"保留冲突更快"这个结论**只在 CUDA 平台验证过**，不能直接套用到 DCU） | 结论写在注释/skill文档里，没有平台标注 | 在 `gemm.cu:37-51` 的注释末尾加一句"以上结论基于 warp=32 的 CUDA 实测，DCU (wavefront=64) 需要重新验证"；到真机后重新跑一遍 dcu_perf.md §3 那种 A/B 实测，不要假设结论照搬 |
@@ -48,50 +70,58 @@ AMD/HCC 后端时，是否会自动让 `cuda*`（而不是 `hip*`）这些名字
 
 ## 高风险项的建议写法（仅供参考，未落地代码）
 
-### 建议 1：统一的 CUDA/HIP 符号兼容层
+### 建议 1：统一的 CUDA/HIP 符号兼容层 —— ✅ 已实现并真机验证通过
 
-在三个文件共用一个小的兼容头（例如新建 `kernels/common/gpu_compat.h`，三个
-`.cu` 文件顶部各 `#include` 一次），思路是**保留现有代码里的 `cuda*` 名字
-不变**，让宏在 HIP 编译路径下把它们映射到 `hip*`：
+在三个文件共用一个小的兼容头 `kernels/common/gpu_compat.h`（三个 `.cu`
+文件顶部各 `#include "../common/gpu_compat.h"` 一次），思路是**保留现有
+代码里的 `cuda*` 名字不变**，让宏在 HIP 编译路径下把它们映射到 `hip*`。
+
+以下是真机验证通过的最终版本（与仓库里 `kernels/common/gpu_compat.h` 保持
+同步；关键点是用 `__HIPCC__` 路由，原因见开头"最高优先级发现"的更新）：
 
 ```cpp
 // kernels/common/gpu_compat.h
 #pragma once
 
-#ifdef __HIP_PLATFORM_HCC__
+// Route on __HIPCC__ (hipcc 编译器驱动预定义的宏), 不要用
+// __HIP_PLATFORM_HCC__/__HIP_PLATFORM_AMD__ —— 那两个宏是 hip_runtime.h
+// 自己在被 include 之后才定义出来的，用来判断"要不要 include 它"是
+// 死循环，真机上永远不会触发。
+#ifdef __HIPCC__
   #include <hip/hip_runtime.h>
-  #define cudaError_t                                 hipError_t
+
+  // --- 已通过 test_min.cu 在真机上逐个确认 ---
+  #define cudaError_t                                  hipError_t
   #define cudaSuccess                                  hipSuccess
-  #define cudaGetErrorString                           hipGetErrorString
-  #define cudaMalloc                                   hipMalloc
-  #define cudaFree                                     hipFree
-  #define cudaMemcpy                                   hipMemcpy
-  #define cudaMemcpyHostToDevice                       hipMemcpyHostToDevice
-  #define cudaMemcpyDeviceToHost                       hipMemcpyDeviceToHost
-  #define cudaMemset                                   hipMemset
-  #define cudaGetLastError                             hipGetLastError
-  #define cudaDeviceSynchronize                        hipDeviceSynchronize
-  #define cudaEvent_t                                  hipEvent_t
-  #define cudaEventCreate                              hipEventCreate
-  #define cudaEventRecord                              hipEventRecord
-  #define cudaEventSynchronize                         hipEventSynchronize
-  #define cudaEventElapsedTime                         hipEventElapsedTime
-  #define cudaEventDestroy                             hipEventDestroy
-  #define cudaFuncSetAttribute                         hipFuncSetAttribute
-  #define cudaFuncAttributeMaxDynamicSharedMemorySize  hipFuncAttributeMaxDynamicSharedMemorySize
-  #define cudaDeviceProp                                hipDeviceProp_t
-  #define cudaGetDevice                                hipGetDevice
-  #define cudaGetDeviceProperties                      hipGetDeviceProperties
+  #define cudaGetErrorString                            hipGetErrorString
+  #define cudaMalloc                                    hipMalloc
+  #define cudaFree                                      hipFree
+
+  // --- 同样的映射模式，随 GEMM 一起在真机验证通过（见"真机验证记录"），
+  //     softmax.cu / flash_attn.cu 尚未单独逐条确认 ---
+  #define cudaGetLastError                              hipGetLastError
+  #define cudaMemcpy                                     hipMemcpy
+  #define cudaMemset                                     hipMemset
+  #define cudaMemcpyHostToDevice                         hipMemcpyHostToDevice
+  #define cudaMemcpyDeviceToHost                         hipMemcpyDeviceToHost
+  #define cudaDeviceSynchronize                          hipDeviceSynchronize
+  #define cudaEvent_t                                    hipEvent_t
+  #define cudaEventCreate                                hipEventCreate
+  #define cudaEventRecord                                hipEventRecord
+  #define cudaEventSynchronize                           hipEventSynchronize
+  #define cudaEventElapsedTime                           hipEventElapsedTime
+  #define cudaEventDestroy                               hipEventDestroy
+  #define cudaFuncSetAttribute                           hipFuncSetAttribute
+  #define cudaFuncAttributeMaxDynamicSharedMemorySize    hipFuncAttributeMaxDynamicSharedMemorySize
 #else
   #include <cuda_runtime.h>
 #endif
 ```
 
-**真机验证时请先检查一件事**：DTK 自带的 `hip_runtime.h` 有没有已经内置类
-似的 `cuda*→hip*` 兼容宏——如果有，上面这份手写的宏定义会和 DTK 自带的重
-复定义冲突（编译报 macro redefinition）。这也是为什么这条只给"建议"、不
-直接改代码的原因：需要先看一眼真实的 DTK 头文件内容。如果 DTK 没有提供，
-再采用上面这份。
+真机验证确认：DTK 22.10.1 的 `hip_runtime.h` **没有**内置 `cuda*→hip*` 的
+兼容宏（真机编译报 `cudaMalloc` 等符号"未声明"），所以上面这份手写映射
+是必须的，不存在宏重复定义冲突的问题。列表覆盖三个 kernel 文件里实际用到
+的全部 19 个 `cuda*` 符号（grep 出来的，不是假设的完整 CUDA API 列表）。
 
 ### 建议 2：`configure_smem` 的平台分支
 
@@ -153,6 +183,49 @@ cmd = [*compiler_cmd, "-o", out_base, SRC[op]]
 `-arch=sm_120` 本身也不该硬编码（对其他 CUDA 卡不通用），建议长期改成从
 `torch.cuda.get_device_capability()` 动态生成，但这是次要问题，不阻塞 DCU
 部署。
+
+---
+
+## 真机验证记录
+
+**环境**：海光 DCU，gfx906/gfx926，DTK 22.10.1，`hipcc` 编译。
+
+**验证对象**：`kernels/gemm/gemm.cu`（通过 `kernels/common/gpu_compat.h`），
+测试数据 M=K=N=64，随机矩阵（`torch.manual_seed(42)` 生成，与
+`validate_gemm.py`/`kernels/gemm/test_data/generate_test_data.py` 同一套
+生成逻辑）。
+
+**结果**：
+
+| 步骤 | 结果 |
+|---|---|
+| `hipcc` 编译 `gemm.cu`（含 `gpu_compat.h`） | ✅ 成功，无需额外修改 |
+| 运行（`run_gemm.sh` → `./gemm/gemm 64 64 64 ...`） | ✅ exit 0 |
+| 输出精度 vs. 本地 CUDA (nvcc) 结果 | ✅ **bit-for-bit 一致** |
+
+精度结果 bit-for-bit 一致，说明：
+- `double` 累加器在 gfx906 上数值行为与 NVIDIA 平台一致（预期之内，
+  IEEE 754 标准类型，不依赖厂商实现）。
+- `float4` 向量化 load/store（含对齐 fallback 逻辑）在 HIP 路径下产出的
+  结果与 CUDA 路径完全一致，前一版报告里"类型/宏可用性未验证"这一条对
+  GEMM 而言可以视为已解决。
+
+**这一轮只验证了正确性，以下几项仍然是"待验证"，结论不变**（未重新测量，
+不要误读为已解决）：
+
+- gemm.cu:37-51 的 bank conflict 分析（wavefront=64 下是否从 2-way 恶化
+  成 4-way）—— 本轮未测。
+- flash_attn.cu 的 K/V tile bank conflict —— 本轮未测（flash_attn.cu 也
+  未在真机上单独跑过）。
+- `double` 累加器在 DCU 上的**相对性能开销**（dcu_perf.md 里 RTX5090 测
+  出的"GEMM 比 PyTorch 慢 47-66x"这类具体倍数）—— 本轮只验证了正确性，
+  没有跑 benchmark.py，性能倍数需要单独重测，不能因为正确性通过了就假设
+  性能结论也成立。
+- `softmax.cu` / `flash_attn.cu` 尚未在真机上单独编译运行过，虽然共用同
+  一份 `gpu_compat.h`，理论上应该同样能编译通过，但没有实测确认。
+- `flash_attn.cu` 的 `configure_smem()`（`cudaFuncSetAttribute` 的 HIP
+  分支，即"建议 2"）尚未实现/验证 —— extreme 档 (4096,128) 需要 64 KiB
+  共享内存这件事，在真机上是否会启动失败，仍然未知。
 
 ---
 
