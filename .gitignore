@@ -5,3 +5,8 @@
 tmp_*
 __pycache__/
 *.pyc
+
+# Packaging artifacts for real-hardware upload — duplicate already-committed
+# source, not meant to be tracked (rebuilt on demand, see docs/dcu_portability_review.md)
+*.zip
+test_min/
