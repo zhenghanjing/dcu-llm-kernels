@@ -22,6 +22,8 @@
 // Usage:          ./flash_attn <seq_len> <head_dim> <Q.bin> <K.bin> <V.bin> <O.bin>
 //   All .bin: raw float32, seq_len*head_dim elements, row-major.
 
+#include "../common/gpu_compat.h"
+
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -31,7 +33,11 @@
 // ---------------------------------------------------------------------------
 // Platform portability
 // ---------------------------------------------------------------------------
-#ifdef __HIP_PLATFORM_HCC__
+// __HIPCC__, not __HIP_PLATFORM_HCC__/__HIP_PLATFORM_AMD__: those are
+// defined by hip_runtime.h itself, not by the compiler driver, so checking
+// them here (before/without including that header) never actually
+// triggered on real hardware. See kernels/common/gpu_compat.h.
+#ifdef __HIPCC__
   constexpr int WARP_SIZE = 64;   // DCU (gfx906)
 #else
   constexpr int WARP_SIZE = 32;   // NVIDIA CUDA
