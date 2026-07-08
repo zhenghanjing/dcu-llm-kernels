@@ -40,6 +40,8 @@ import time
 import torch
 import torch.nn.functional as F
 
+from _compiler import pick_compiler
+
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
@@ -97,8 +99,15 @@ OP_LABEL = {"gemm": "GEMM", "softmax": "Softmax", "flash": "FlashAttn"}
 # Compilation
 # ---------------------------------------------------------------------------
 def compile_kernels(skip: bool) -> dict:
+    """Compile all three kernels with the detected toolchain (hipcc if present
+    on PATH, else nvcc -O2 -arch=sm_120 — see tests/_compiler.py)."""
     ok = {}
     print("Compiling kernels...")
+
+    if not skip:
+        compiler_cmd, compiler_label = pick_compiler()
+        print(f"  using compiler: {compiler_label}")
+
     for op in ("gemm", "softmax", "flash"):
         if skip:
             found = os.path.isfile(BIN[op])
@@ -108,7 +117,7 @@ def compile_kernels(skip: bool) -> dict:
             continue
 
         out_base = BIN[op][:-4] if BIN[op].endswith(".exe") else BIN[op]
-        cmd = ["nvcc", "-O2", "-arch=sm_120", "-o", out_base, SRC[op]]
+        cmd = [*compiler_cmd, "-o", out_base, SRC[op]]
         t0 = time.perf_counter()
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
@@ -122,7 +131,7 @@ def compile_kernels(skip: bool) -> dict:
                 print(f"  [FAIL] {op:<8}  {lines[-1][:90] if lines else '(no stderr)'}")
         except FileNotFoundError:
             ok[op] = False
-            print(f"  [FAIL] {op:<8}  nvcc not found in PATH")
+            print(f"  [FAIL] {op:<8}  {compiler_label} not found in PATH")
         except subprocess.TimeoutExpired:
             ok[op] = False
             print(f"  [FAIL] {op:<8}  compilation timed out (>180 s)")

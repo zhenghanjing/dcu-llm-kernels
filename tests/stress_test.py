@@ -8,7 +8,8 @@ Usage:
 Options:
     --skip-compile   Use existing binaries without recompiling.
 
-Compile flags: nvcc -O2 -arch=sm_120
+Compile flags: hipcc -O2 if hipcc is on PATH, else nvcc -O2 -arch=sm_120
+  (see tests/_compiler.py)
 
 Test categories:
   boundary  — minimal shapes (1x1x1, seq=1)
@@ -40,6 +41,8 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from _compiler import pick_compiler
 
 # Use exact FP32 in PyTorch reference (disable TF32 on Ampere+)
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -110,9 +113,15 @@ class Result:
 # Compilation
 # ---------------------------------------------------------------------------
 def compile_kernels(skip: bool) -> dict:
-    """Compile all three kernels with nvcc -O2 -arch=sm_120."""
+    """Compile all three kernels with the detected toolchain (hipcc if present
+    on PATH, else nvcc -O2 -arch=sm_120 — see tests/_compiler.py)."""
     ok = {}
     print("Compiling kernels...")
+
+    if not skip:
+        compiler_cmd, compiler_label = pick_compiler()
+        print(f"  using compiler: {compiler_label}")
+
     for op in ("gemm", "softmax", "flash"):
         if skip:
             found = os.path.isfile(BIN[op])
@@ -121,9 +130,10 @@ def compile_kernels(skip: bool) -> dict:
             print(f"  [{tag}] {op:<8}  {'binary found' if found else 'MISSING'}")
             continue
 
-        # nvcc expects the output path without .exe; it appends .exe on Windows
+        # nvcc/hipcc both expect the output path without .exe; they append
+        # .exe on Windows themselves.
         out_base = BIN[op][:-4] if BIN[op].endswith(".exe") else BIN[op]
-        cmd = ["nvcc", "-O2", "-arch=sm_120", "-o", out_base, SRC[op]]
+        cmd = [*compiler_cmd, "-o", out_base, SRC[op]]
         t0  = time.perf_counter()
         try:
             r  = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
@@ -138,7 +148,7 @@ def compile_kernels(skip: bool) -> dict:
                 print(f"  [FAIL] {op:<8}  {snippet}")
         except FileNotFoundError:
             ok[op] = False
-            print(f"  [FAIL] {op:<8}  nvcc not found in PATH")
+            print(f"  [FAIL] {op:<8}  {compiler_label} not found in PATH")
         except subprocess.TimeoutExpired:
             ok[op] = False
             print(f"  [FAIL] {op:<8}  compilation timed out (>180 s)")
