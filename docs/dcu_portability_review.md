@@ -56,8 +56,8 @@ AMD/HCC 后端时，是否会自动让 `cuda*`（而不是 `hip*`）这些名字
 
 | 文件:行号 | 问题描述 | 风险等级 | 当前处理方式 | 建议动作 |
 |---|---|---|---|---|
-| **gemm.cu 全文件**（如 182,249-253,260-275,285-287,322-336,347）<br>**softmax.cu 全文件**（如 93-99,152-177,219-231）<br>**flash_attn.cu 全文件**（如 186-192,269-311,349-367,377） | 所有 `cuda*` API（Malloc/Memcpy/Free/Event*/GetLastError/DeviceSynchronize/Memset 等）都是字面量直写。三个文件各自维护一份重复的 `check()` 辅助函数（gemm.cu:182、softmax.cu:93、flash_attn.cu:186），均以 `cudaError_t`/`cudaSuccess`/`cudaGetErrorString` 为参数。 | **已解决** | 三个文件顶部各加一行 `#include "../common/gpu_compat.h"`；该头文件用 `#ifdef __HIPCC__` 路由，在 HIP 路径下 `#include <hip/hip_runtime.h>` 并把三个文件实际用到的全部 19 个 `cuda*` 符号 `#define` 成对应的 `hip*` 名字，CUDA 路径下改成显式 `#include <cuda_runtime.h>`（原来隐式依赖 nvcc 注入）。方案细节见下方"建议 1"（已更新为真机验证过的最终版本） | GEMM 已在真机 (gfx906, DTK 22.10.1) 验证**编译 + 运行成功**，double 累加器精度结果与本地 CUDA bit-for-bit 一致，见下方"真机验证记录"。softmax.cu / flash_attn.cu 引用同一份 `gpu_compat.h`，理论上应同样生效，但**尚未在真机上单独跑通**，建议后续补验证 |
-| flash_attn.cu:197-205 | `configure_smem()`：`cudaFuncSetAttribute(flash_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`，且触发阈值硬编码为 NVIDIA Volta+ 专属的 `48*1024` 字节 | **高** | 只有 CUDA 分支，无 HIP 分支 | 见下方"建议 2"；另外这里有个**容量风险**：extreme 档 (seq_len=4096, head_dim=128) 需要 `2×64×128×4=65536` 字节（恰好 64 KiB），如果 gfx906 每个 workgroup 的 LDS 总预算就是 64 KiB（无 NVIDIA 式的"48KiB默认+opt-in"分层），这个 shape 在 DCU 上可能连启动都启动不了，需要真机验证后决定是否要降低 BLOCK_SIZE |
+| **gemm.cu 全文件**（如 182,249-253,260-275,285-287,322-336,347）<br>**softmax.cu 全文件**（如 93-99,152-177,219-231）<br>**flash_attn.cu 全文件**（如 186-192,269-311,349-367,377） | 所有 `cuda*` API（Malloc/Memcpy/Free/Event*/GetLastError/DeviceSynchronize/Memset 等）都是字面量直写。三个文件各自维护一份重复的 `check()` 辅助函数（gemm.cu:182、softmax.cu:93、flash_attn.cu:186），均以 `cudaError_t`/`cudaSuccess`/`cudaGetErrorString` 为参数。 | **已解决** | 三个文件顶部各加一行 `#include "../common/gpu_compat.h"`；该头文件用 `#ifdef __HIPCC__` 路由，在 HIP 路径下 `#include <hip/hip_runtime.h>` 并把三个文件实际用到的全部 19 个 `cuda*` 符号 `#define` 成对应的 `hip*` 名字，CUDA 路径下改成显式 `#include <cuda_runtime.h>`（原来隐式依赖 nvcc 注入）。方案细节见下方"建议 1"（已更新为真机验证过的最终版本） | GEMM、Softmax、Flash Attention 三个算子均已在真机 (gfx906/gfx926, DTK 22.10.1) 验证**编译 + 运行成功**，输出与本地 CUDA 结果一致（GEMM bit-for-bit；Softmax/FlashAttn 逐位一致或差异在 1e-6 量级的浮点舍入范围内，远低于 atol）。三个文件均已单独跑通，见下方"真机验证记录" |
+| ~~flash_attn.cu:197-205~~ configure_smem() | `configure_smem()`：`cudaFuncSetAttribute(flash_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`，且触发阈值硬编码为 NVIDIA Volta+ 专属的 `48*1024` 字节 | ~~高~~ **已解决** | HIP 分支已实现（见"建议 2"最终版）：查询 `hipGetDeviceProperties().sharedMemPerBlock` 真实上限，超限报错退出，不再套用 CUDA 的 48KiB 阈值 | 真机验证通过：smem_risk 用例 (seq_len=128, head_dim=128, 64KiB 动态共享内存) 成功触发 `hipFuncSetAttribute` 并正常执行，输出与本地 CUDA 一致。**验证过程中发现并修复了一个新 bug**：`cudaFuncSetAttribute`/`hipFuncSetAttribute` 第一个参数是 `const void*`，直接传裸核函数符号 `flash_attn_kernel` 依赖"函数指针隐式转 void*"，MSVC/nvcc 当非标准扩展放行，但 hipcc 的 Clang 前端按标准 C++ 严格拒绝，报 `no matching function for call to 'hipFuncSetAttribute'`。修复：两个分支的调用点都显式转换成 `(const void*)flash_attn_kernel`。详见下方"真机验证记录" |
 | tests/stress_test.py:126<br>tests/benchmark.py:111 | `cmd = ["nvcc", "-O2", "-arch=sm_120", "-o", out_base, SRC[op]]`，硬编码 nvcc 可执行名和 CUDA 专属架构标志 `-arch=sm_120`（本机 RTX 5090 的 compute capability，对其他 CUDA 卡也不通用，更不用说 DCU） | **高** | 只识别 nvcc，无 hipcc 分支/检测逻辑 | 见下方"建议 3" |
 | gemm.cu:37-51（注释） | Bank conflict 分析（B-fragment `sB[kk][threadIdx.x*TN]` 的 2-way 冲突）是按 **32 个 bank + 32 线程一个 warp** 推导的。AMD gfx906 的 LDS 同样是 32 bank（这点历史上和 NVIDIA 一致），但 **wavefront 是 64 而不是 32**——同一条 shared memory 指令里竞争这 8 个不冲突槽位的线程数会翻倍（16 个不同地址 × 2 份 wavefront-内重复，而不是 warp 情形下的 1 份），结论很可能从"2-way 冲突"恶化成"4-way 冲突"，而不是保持不变 | **中**（不影响正确性，但 dcu_perf.md 里记录的"保留冲突更快"这个结论**只在 CUDA 平台验证过**，不能直接套用到 DCU） | 结论写在注释/skill文档里，没有平台标注 | 在 `gemm.cu:37-51` 的注释末尾加一句"以上结论基于 warp=32 的 CUDA 实测，DCU (wavefront=64) 需要重新验证"；到真机后重新跑一遍 dcu_perf.md §3 那种 A/B 实测，不要假设结论照搬 |
 | flash_attn.cu:118-128 | K/V tile 的 float4 向量化写入（`sK[row*d+col0]`/`sV[row*d+col0]`）存在和 GEMM B-load 结构相同的 bank conflict（每个 kv-tile 触发一次），但**这个仓库里从未把它写成文字分析**（此前只分析了 GEMM 的 bank conflict，flash_attn 这处是这次审查新发现的） | **中** | 完全没有分析/注释，也没有 fallback | 到真机后补一次和 GEMM 同样方法论的分析（wavefront=64 版本），并用 benchmark.py 实测是否值得修（大概率不值得，这个 load 不在热循环里，参考 dcu_perf.md §3 的方法论） |
@@ -123,32 +123,36 @@ AMD/HCC 后端时，是否会自动让 `cuda*`（而不是 `hip*`）这些名字
 是必须的，不存在宏重复定义冲突的问题。列表覆盖三个 kernel 文件里实际用到
 的全部 19 个 `cuda*` 符号（grep 出来的，不是假设的完整 CUDA API 列表）。
 
-### 建议 2：`configure_smem` 的平台分支
+### 建议 2：`configure_smem` 的平台分支 —— ✅ 已实现并真机验证通过
+
+以下是真机验证通过的最终版本（与仓库里 `kernels/flash_attention/flash_attn.cu`
+保持同步；路由用 `__HIPCC__`，原因同"建议 1"）：
 
 ```cpp
 static void configure_smem(size_t smem_bytes)
 {
-#ifdef __HIP_PLATFORM_HCC__
+#ifdef __HIPCC__
     // AMD/DCU 的 LDS 是单一预算，没有 NVIDIA 那种"默认48KiB+opt-in"两级模型；
     // 48*1024 这个阈值在这里没有意义。改成查询设备真实上限。
-    // TODO 真机验证: hipFuncAttributeMaxDynamicSharedMemorySize 是否存在、
-    // 语义是否和 CUDA 一致；sharedMemPerBlock 是否就是 gfx906 的 64KiB LDS。
     int device = 0;
     check(cudaGetDevice(&device), "get device");
     cudaDeviceProp prop{};
     check(cudaGetDeviceProperties(&prop, device), "get device properties");
     if (smem_bytes > (size_t)prop.sharedMemPerBlock) {
-        fprintf(stderr, "requested shared memory %zu bytes exceeds device limit %d bytes\n",
-                smem_bytes, prop.sharedMemPerBlock);
+        fprintf(stderr,
+                "flash_attn: requested dynamic shared memory %zu bytes "
+                "exceeds device limit %zu bytes (LDS per workgroup on this "
+                "DCU) -- reduce BLOCK_SIZE or head_dim for this shape\n",
+                smem_bytes, (size_t)prop.sharedMemPerBlock);
         exit(1);
     }
-    check(cudaFuncSetAttribute(flash_attn_kernel,
+    check(cudaFuncSetAttribute((const void*)flash_attn_kernel,
                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int)smem_bytes),
           "set max dynamic shared memory");
 #else
     if (smem_bytes > 48 * 1024) {
-        check(cudaFuncSetAttribute(flash_attn_kernel,
+        check(cudaFuncSetAttribute((const void*)flash_attn_kernel,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)smem_bytes),
               "set max dynamic shared memory");
@@ -156,8 +160,25 @@ static void configure_smem(size_t smem_bytes)
 #endif
 }
 ```
+
 （这里假设建议 1 的兼容层已经生效，所以两个分支里都还是写 `cudaXxx`；如果
 不采用建议 1，HIP 分支需要手动换成 `hipXxx`。）
+
+**真机踩坑记录**：第一版实现里两个分支的 `cudaFuncSetAttribute` 调用都是直接
+传 `flash_attn_kernel`（不带 `(const void*)` 转换），本地 nvcc 编译完全没问题
+——因为 nvcc/MSVC 把"核函数符号隐式转 `void*`"当非标准扩展默许通过了。但
+hipcc 的 Clang 前端按标准 C++ 严格执行，第一次真机编译直接报错：
+
+```
+error: no matching function for call to 'hipFuncSetAttribute'
+note: no known conversion from 'void (...)' to 'const void *' for 1st argument
+```
+
+`cudaFuncSetAttribute`/`hipFuncSetAttribute` 的第一个参数类型两边都声明为
+`const void*`，问题完全在调用点缺少显式转换，不是 API 语义差异。加上
+`(const void*)` 转换后两个平台都编译通过，且这个改动对 CUDA 路径的行为没有
+任何影响（本地 nvcc 重新编译 + `validate_flash_attn.py` 64×64 和 128×128
+两个 shape 都仍然 PASS）。
 
 ### 建议 3：编译脚本识别 hipcc
 
@@ -210,33 +231,290 @@ cmd = [*compiler_cmd, "-o", out_base, SRC[op]]
   结果与 CUDA 路径完全一致，前一版报告里"类型/宏可用性未验证"这一条对
   GEMM 而言可以视为已解决。
 
-**这一轮只验证了正确性，以下几项仍然是"待验证"，结论不变**（未重新测量，
-不要误读为已解决）：
+**验证对象**：`kernels/softmax/softmax.cu`（通过 `kernels/common/gpu_compat.h`），
+测试数据 M=N=64，`torch.manual_seed(42)` 生成，与 `validate_softmax.py`/
+`generate_test_data.py` 同一套生成逻辑。
 
-- gemm.cu:37-51 的 bank conflict 分析（wavefront=64 下是否从 2-way 恶化
-  成 4-way）—— 本轮未测。
-- flash_attn.cu 的 K/V tile bank conflict —— 本轮未测（flash_attn.cu 也
-  未在真机上单独跑过）。
+**结果**：
+
+| 步骤 | 结果 |
+|---|---|
+| `hipcc` 编译 `softmax.cu` | ✅ 成功（gfx906/gfx926/host 三目标均通过，仅 1 条无关的 `RAND_MAX` int→float 转换警告） |
+| 运行（`run_softmax.sh` → `./softmax/softmax 64 64 ...`） | ✅ exit 0 |
+| 输出 `Y[row=0, 0:8]` vs. 本地 CUDA (nvcc) 结果 | ✅ **逐位一致**：`0.021136 0.021840 0.012828 0.022829 0.012925 0.015953 0.011306 0.019344` |
+
+`softmax.cu` 未经任何额外修改即真机编译运行成功，`gpu_compat.h` 的兼容层对
+它同样生效，验证了"建议 1"的映射表并非只对 GEMM 用到的符号子集有效。
+
+**验证对象**：`kernels/flash_attention/flash_attn.cu`（通过 `gpu_compat.h`
++ 已修复的 `configure_smem()`，见"建议 2"），两个 shape：
+
+| 用例 | seq_len | head_dim | 动态共享内存 | 触发 `hipFuncSetAttribute`？ |
+|---|---|---|---|---|
+| basic | 64 | 64 | 32 KiB | 否（低于 48KiB CUDA 阈值参照线，仅测基础正确性） |
+| smem_risk | 128 | 128 | 64 KiB | 是——与审查报告标记高风险的 extreme 档 (4096,128) 单块共享内存占用完全相同 |
+
+**结果**：
+
+| 步骤 | 结果 |
+|---|---|
+| `hipcc` 编译（首次尝试） | ❌ `error: no matching function for call to 'hipFuncSetAttribute'`（见"建议 2"真机踩坑记录） |
+| 加 `(const void*)` 转换后重新编译 | ✅ 成功（gfx906/gfx926/host 三目标，仅 3 条无关的 `RAND_MAX` 警告） |
+| 运行（`run_flash_attn.sh`，basic + smem_risk 依次执行） | ✅ exit 0，两段均正常输出，`smem_risk` 未出现 launch failure |
+| basic 输出 `O[row=0, 0:8]` vs. 本地 CUDA | ✅ 一致（末位 `0.440630` vs. `0.440629`，差 1e-6 量级浮点舍入，远低于 atol=1e-3） |
+| smem_risk 输出 `O[row=0, 0:8]` vs. 本地 CUDA | ✅ **逐位一致**：`0.468841 0.505699 0.498429 0.492448 0.496844 0.519549 0.476674 0.516198` |
+
+这一轮确认了审查报告开头列出的**唯一"高风险且未验证"项**——gfx906 上
+64 KiB 动态共享内存请求能否通过 `hipFuncSetAttribute` 正常启动——结论是
+**可以**，且过程中额外发现并修复了一个真实的编译期 bug（核函数指针到
+`const void*` 的隐式转换在 hipcc 下不成立），而不是一次"顺利通过"。
+
+### gemm_large_tile.cu：dcu_hip_porting.md 第 3、4 条的独立复现验证
+
+**验证对象**：`kernels/gemm/gemm_large_tile.cu`——不在本审查报告原始范围内
+的新增 kernel（GEMM 的动态共享内存变体），把 `gemm.cu` 编译期固定大小的
+静态 shared memory tile 改成运行时可选的 `extern __shared__` 动态共享
+内存，提供 small/medium/large/xlarge 四档 tile 配置。`configure_smem()`
+是照着 `flash_attn.cu` 已验证过的模式（"建议 2"）独立重写的一份实现，
+不是复制粘贴同一份代码。
+
+**背景**：xlarge 配置需要 64 KiB 动态共享内存——跟 `flash_attn.cu` 的
+`smem_risk` 用例是同一个边界值（同样超过 CUDA 48KiB 默认阈值、同样卡在
+gfx906 LDS 64KiB 单一预算上限），但这次是完全独立写的一份 kernel，本地
+nvcc 开发阶段就把 `(const void*)` cast 和 gfx906 LDS 查询模式复用了进来
+（详见 `.claude/skills/dcu_hip_porting.md` 第 3、4 条），真机验证前只是
+"假设复用有效"，尚未被 hipcc 实际编译过。
+
+**结果**：
+
+| 步骤 | 结果 |
+|---|---|
+| `hipcc` 编译（首次尝试） | ✅ 一次性编译成功（gfx906/gfx926/host 三目标），无任何调试修复循环——`(const void*)` cast 和 LDS 查询这次不是"踩坑后修复"，是照抄已有经验一次写对 |
+| 运行（`run_gemm_large_tile.sh`，4 个 tile 配置 × 3 个 shape，共 12 组，含 xlarge 的 64KiB 动态共享内存路径） | ✅ exit 0，12/12 全部正常输出，xlarge 组无 launch failure |
+| 输出精度 vs. 本地 CUDA (nvcc) 参考 | ✅ **12/12 全部 bit-for-bit 一致**，且与 `test_data/{boundary,non2n,large}` 下已验证过的 `gemm.cu` 参考值完全一致（符合预期：只是共享内存分块方式不同，数学结果不变） |
+
+这一轮的意义不在于"又跑通一个 kernel"，而是**首次验证了 dcu_hip_porting.md
+第 3、4 条经验能否被复用到一个全新写的 kernel、且复用后首次真机编译即
+成功**，不需要重复 `flash_attn.cu` 当年那次"先失败再修复"的过程。此前
+用 RMSNorm 做的复用测试只验证了第 1、2 条（符号映射、`__HIPCC__` 路由）
+——RMSNorm 不涉及动态共享内存，没能触发第 3、4 条；这次 `gemm_large_tile.cu`
+是专门为验证第 3、4 条设计的任务，结果是**四条经验全部可复用，且这次复用
+后首次真机编译即成功**，是 Phase 3 skill 复用这条研究主线目前最完整的一次
+正面证据。
+
+### 压力测试记录（boundary / non-2^n / large，9 个 shape）
+
+在上面单 shape 验证通过之后，补跑了一轮覆盖面更宽的正确性测试，对应
+`tests/stress_test.py` 里 `TESTS` 列表定义的 boundary/non-2^n/large 三个
+类别（extreme 档只对 GEMM 有意义，本轮跳过，见下方"仍待验证"）。因为
+DCU 计算节点上没有装 torch，`stress_test.py` 本身无法直接在真机跑，改用
+和上面单 shape 一致的方法：本地（有 torch）生成输入数据 + 参考输出预览，
+真机只编译、跑裸二进制、打印预览行，人工/逐位比对。
+
+| 算子 | 类别 | Shape | 真机输出 vs. 本地参考 |
+|---|---|---|---|
+| GEMM | boundary | M=K=N=1 | ✅ 逐位一致：`0.807280` |
+| GEMM | non-2^n | M=100,K=300,N=200 | ✅ 逐位一致：`73.222260 67.406136 64.838776 69.683899 72.360916 74.046577 69.190125 73.181534` |
+| GEMM | large | M=K=N=256 | ✅ 逐位一致：`61.034290 64.137817 60.134647 56.624046 60.524803 61.831390 58.626888 58.881058` |
+| Softmax | boundary | M=N=1 | ✅ 逐位一致：`1.000000` |
+| Softmax | non-2^n | M=100,N=300 | ✅ 逐位一致：`0.004824 0.004985 0.002928 0.005210 0.002950 0.003641 0.002580 0.004415` |
+| Softmax | large | M=128,N=1024 | ✅ 逐位一致：`0.001395 0.001441 0.000846 0.001506 0.000853 0.001053 0.000746 0.001276` |
+| FlashAttn | boundary | seq_len=1,head_dim=64 | ✅ 逐位一致：`0.919235 0.400768 0.930198 0.655791 0.076602 0.846018 0.362428 0.308337` |
+| FlashAttn | non-2^n | seq_len=100,head_dim=64 | ✅ 逐位一致：`0.481997 0.455950 0.514564 0.538493 0.482121 0.513749 0.502959 0.501434` |
+| FlashAttn | large | seq_len=512,head_dim=64 | ✅ 一致（末位 `0.508060` vs. 本地 `0.508061`，1e-6 量级浮点舍入，远低于 atol=1e-3） |
+
+9/9 全部通过。GEMM/Softmax 全部逐位一致；FlashAttn 只有 large 档最后一位
+小数有 1e-6 量级差异，符合分块+在线 softmax 改变浮点累加顺序的预期，不是
+bug。
+
+**操作性发现（不是代码问题，是这个真机门户本身的限制）**：把三个算子的
+9 个 shape 打包进同一个 zip（46 个文件，~2.8MB）一次性提交时，门户后端
+返回 `Internal Server Error`（500），且门户前端还有一个独立的 JS bug
+（`Failed to execute 'text' on 'Response': body stream already read`，
+对同一个 Response 调用了两次 `.text()`），一度让人误以为是请求卡住而非
+真的报错。用浏览器 DevTools 直接查看该请求的原始响应确认了是后端 500，
+不是前端假象。把同一份数据拆成三个单算子小包（各自 12~18 个文件，
+0.55~1.1MB）分别提交后，三个全部成功——说明这不是任何一个算子的数据或
+`gpu_compat.h`/`configure_smem()` 代码本身的问题，而是"单次请求文件数
+过多/请求过于复杂"触发了后端某个未知限制或 bug。这一点已经反馈给维护
+该门户的老师，后续如果要一次性提交更大规模的测试（比如真正的 extreme
+档，或更完整的 shape 矩阵），建议默认按算子拆分成多个小请求提交，不要
+指望单次大请求能稳定跑通。
+
+**这一轮只验证了正确性，以下几项当时仍然是"待验证"**（本节保留原始记录；
+bank conflict 和 double 累加器这两条已在后续一轮真机隔离 A/B 实验中补齐，
+结论见 `.claude/skills/dcu_perf.md` 第 8 节，不要只看本节旧文字）：
+
+- ~~gemm.cu:37-51 的 bank conflict 分析（wavefront=64 下是否从 2-way 恶化
+  成 4-way）—— 本轮未测。~~ —— ✅ **已验证**：用 `-DGEMM_BN=32` 编译对照
+  版本，在真机上对 (100,300,200)/(1024³)/(4096³) 三档各独立跑 15 次
+  `--bench`。结论和 RTX5090 方向不同：消除 conflict（BN=32）在 DCU 上
+  全部三档都更慢（慢 14.2%/30.9%/5.3%），而 RTX5090 上小尺寸曾快 45%。
+  当前默认 BN=64 在 DCU 上依然是更优选择。完整数据见
+  `.claude/skills/dcu_perf.md` 第 8 节。
+- flash_attn.cu 的 K/V tile bank conflict —— 本轮未测，仍是待验证。
 - `double` 累加器在 DCU 上的**相对性能开销**（dcu_perf.md 里 RTX5090 测
-  出的"GEMM 比 PyTorch 慢 47-66x"这类具体倍数）—— 本轮只验证了正确性，
-  没有跑 benchmark.py，性能倍数需要单独重测，不能因为正确性通过了就假设
-  性能结论也成立。
-- `softmax.cu` / `flash_attn.cu` 尚未在真机上单独编译运行过，虽然共用同
-  一份 `gpu_compat.h`，理论上应该同样能编译通过，但没有实测确认。
-- `flash_attn.cu` 的 `configure_smem()`（`cudaFuncSetAttribute` 的 HIP
-  分支，即"建议 2"）尚未实现/验证 —— extreme 档 (4096,128) 需要 64 KiB
-  共享内存这件事，在真机上是否会启动失败，仍然未知。
+  出的"GEMM 比 PyTorch 慢 47-66x"这类具体倍数）—— ✅ **已验证**：用
+  `-DGEMM_ACC_T=float` 编译对照版本做真机隔离 A/B，三档 shape 上 float
+  比 double 分别快 1.44x/1.72x/2.41x（差距随规模增大而扩大）。但 float
+  累加器已经在本地 RTX5090 上测出不满足 atol=1e-5（K=8192 时 max error
+  1.12e-02，见 `dcu_numerics.md`），这是平台无关的算法性质，所以这
+  1.44~2.41x 是保证正确性必须付出的代价，不是待优化项，**不采纳**换成
+  float。完整数据见 `.claude/skills/dcu_perf.md` 第 8 节。
+- ~~`flash_attn.cu` 的 smem_risk 用例只验证到 64 KiB 这个边界点，审查报告里
+  真正的 extreme 档 (seq_len=4096, head_dim=128) 是网格规模更大的完整
+  shape，共享内存占用虽然相同，但尚未在这个具体 shape 下跑过，网格并行度/
+  显存等维度仍是"待验证"。~~ —— ✅ **网格/显存维度已验证**：见 dcu_perf.md
+  第 7 节，(4096,128) 这个真正的 extreme 档已经用 `--bench` 模式在真机上
+  完整跑通（编译、执行、计时全部成功，`dcu_monitor.sh` 全程 36 个采样点
+  `avg_use=100.0%`），证明这个 shape 不存在网格规模不足或显存问题。
+  —— ✅ **数值正确性也已验证**：复用 `generate_test_data.py`（seed=42,
+  torch.rand 生成 Q/K/V，显式 scaled-dot-product-attention 算参考值，
+  数据量小，约 6MiB，不需要 GEMM extreme 那种 tile 平铺技巧）生成
+  (seq_len=4096, head_dim=128) 的真实随机数据，真机编译运行成功，输出
+  `O[row=0, 0:8] = 0.500090 0.495556 0.494584 0.498032 0.500829 0.504050
+  0.496310 0.503762`，与本地 CUDA 运行结果**逐位一致**，与参考值差异
+  约 1e-6（`0.494584` vs `0.494585` 等末位差），远低于 atol=1e-3——符合
+  分块 + 在线 softmax 改变浮点累加顺序的预期，不是 bug。至此 FlashAttn
+  的 boundary/non-2^n/large/smem_risk/extreme 五档全部完成数值正确性
+  验证。
+- ~~GEMM 真正的 extreme 档 (4096,4096,4096) 本轮跳过未测（显存/耗时开销大，
+  且上面刚确认了大请求容易触发门户的 500 问题，需要单独、谨慎地提交）。~~
+  —— ✅ **数值正确性已验证**：M=K=N=4096 的完整数据（A/B 各 64MiB）用一个
+  64×64 随机 tile 平铺生成，既保留真实的随机数值（不是全 1 这种平凡数据），
+  又因为大量重复 byte pattern 让 zip 从 128MiB 压缩到 2.46MiB，避免了大文件
+  触发门户不稳定的风险。真机编译运行成功，输出
+  `C[0:8] = 1174.277710 1148.628052 1191.560425 1182.812256 1101.056396
+  1127.069702 1132.155151 1118.189697`，与本地 nvcc + FP64 参考值
+  **bit-for-bit 一致**。至此 GEMM 的 boundary/non-2^n/large/extreme 四档
+  全部完成数值正确性验证。
+
+---
+
+## 资源利用率监控：怎么看出 GPU/DCU 核心真的被用上了
+
+**动机**：前面所有验证都只确认了"编译成功 + exit 0 + 输出精度对得上"，这三项
+全部满足也不能证明 kernel 真的把计算丢给了 GPU/DCU 的核心去跑（理论上也可能
+是别的环节凑巧算对了，或者启动了但完全没吃到算力）。这一节记录两个新增的
+资源利用率监控脚本，以及**具体在输出的哪一行、看哪个字段**才能判断"核心是
+否被用上了"。
+
+### 本地（NVIDIA 开发机）：`kernels/common/gpu_monitor.sh`
+
+用法：`./gpu_monitor.sh <cmd> [args...]`，包装任意命令，后台每秒用
+`nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used
+--format=csv,noheader,nounits -l 1` 采样，命令结束后在最后追加一行：
+
+```
+GPU_UTIL_SUMMARY samples=<N> max_sm_util=<X>% avg_sm_util=<Y>% max_mem_used=<Z>MiB
+```
+
+**看哪里判断核心被用上了**：看这一行里的 `max_sm_util`——只要明显大于
+0%（不需要很高），就说明采样窗口至少捕捉到一次 GPU 正在做计算的时刻。真实
+跑出来的两组对照（`gemm_large_tile --tile=xlarge`，本地 RTX 5090）：
+
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| 持续负载（`--bench`，iters=2000，约 6.8s） | `./gpu_monitor.sh ./gemm_large_tile --bench --tile=xlarge 1024 1024 1024 10 2000` | `GPU_UTIL_SUMMARY samples=7 max_sm_util=99% avg_sm_util=79% max_mem_used=2765MiB` —— **明确看到核心被用上了** |
+| 单发正确性调用（几十微秒） | `./gpu_monitor.sh ./gemm_large_tile --tile=small 256 256 256 ...` | `GPU_UTIL_SUMMARY samples=2 max_sm_util=0% avg_sm_util=0% max_mem_used=2268MiB` —— **不能证明没用上**，只是命令跑得比 1Hz 采样间隔快，采样窗口没对上 kernel 实际执行的那几十微秒 |
+
+**关键踩坑（已修复）**：脚本最初只在 `samples=0` 时打警告，但 `nvidia-smi -l 1`
+首次采样是启动时立即触发的，加上脚本收尾会多等 1 秒，实测单发调用也几乎总能
+采到 1-2 个样本——也就是说上表第二行那种"有样本但 `max_sm_util=0%`"才是最
+常见、最没有信息量的情况，原来的警告条件反而漏掉了它。已改成 `samples=0`
+或 `max_sm_util=0%`（不管 `samples` 是多少）都会打印警告，提醒"这个读数不能
+说明任何问题"，而不是让人误读成"GPU 没被用上"。
+
+**结论**：判断"核心有没有被用上"，只看 `max_sm_util` 这一个字段就够；但只有
+在包了 `--bench`（或其他持续几秒以上的负载）时这个字段才有意义，单发正确性
+调用的 `max_sm_util=0%` 什么都说明不了。
+
+### 真机（DCU）：`kernels/common/dcu_monitor.sh`
+
+真机门户是一次性提交 job → 拿 stdout → 清场的批处理模式，没有交互式监控通道，
+所以采样结果必须打印到 stdout 里才能传回来。用法一样：
+`./dcu_monitor.sh <cmd> [args...]`。
+
+这台机器的 `rocm-smi`（ROCM-SMI 1.4.3，DTK 22.10.1）比 nvidia-smi 原始得多：
+没有内置连续采样参数，是个 Python CLI，每次调用都有真实的进程启动开销，脚本
+自己用一个后台循环反复调用
+`rocm-smi --showuse --showmemuse --csv`（探测阶段确认过这是最干净的可解析
+格式）。命令结束后输出两部分：
+
+1. `--- DCU_UTIL raw samples ---` 之后是每次采样的原始行，格式
+   `cardN,DCU use(%),DCU memory use(%)`（这台机器有 4 张卡，`card1`~`card4`，
+   从 1 开始编号）。
+2. 每张卡一行的汇总：`DCU_UTIL_SUMMARY card=<cardN> samples=<N>
+   max_use=<X>% avg_use=<Y>% max_memuse=<Z>% avg_memuse=<W>%`。
+
+**看哪里判断核心被用上了**：门户用 `--gres=dcu:1` 只分配 1 张卡，但
+`rocm-smi` 看到的是全部 4 张物理卡——**判断标准是看哪张卡的 `avg_use`/
+`max_use` 不是 0，那张就是这次任务实际分配到、且被真正用上的卡；其余 3 张
+应该全程读数为 0**，不是看固定的哪个卡号（换一次提交，分配到的卡号可能不
+一样）。真实跑出的一组数据（`gemm_large_tile --bench --tile=xlarge 1024
+1024 1024 10 2000`）：
+
+```
+DCU_UTIL_SUMMARY card=card1 samples=8 max_use=99% avg_use=64.9% max_memuse=2% avg_memuse=1.9%
+DCU_UTIL_SUMMARY card=card2 samples=8 max_use=0% avg_use=0.0% max_memuse=0% avg_memuse=0.0%
+DCU_UTIL_SUMMARY card=card3 samples=8 max_use=0% avg_use=0.0% max_memuse=0% avg_memuse=0.0%
+DCU_UTIL_SUMMARY card=card4 samples=8 max_use=0% avg_use=0.0% max_memuse=0% avg_memuse=0.0%
+```
+
+`card1` 在 8 个采样点里利用率在 11%~99% 之间波动，其余三张全程 0%——明确
+证明这次分配到的卡（`card1`）真的在跑计算，且门户对 4 张卡的资源隔离符合
+预期（没有互相干扰）。
+
+**关键踩坑（已修复）**：`rocm-smi --csv` 真实输出前面有一行**空行**，脚本
+最初以为表头是第一行、用 `tail -n +2` 跳过，实际跳掉的是那行空行，表头本身
+（`device,DCU use (%),DCU memory use (%)`）留了下来——这行也是 3 个逗号
+分隔字段，被 `awk` 当成一张叫 `device` 的假卡计入统计，输出里多了一行
+`DCU_UTIL_SUMMARY card=device ... max_use=0% ...`，容易被误读成第 5 张卡。
+已改成用 `grep '^card'` 过滤（不依赖固定行号，`awk` 里也加了
+`$1 !~ /^card[0-9]+$/` 的第二层防御），表头/空行不管出现在第几行都会被
+正确排除。
+
+**额外的附带发现（非正式数据，仅供参考）**：这次 `--bench` 读数里
+`BENCH_MS 1.279227`，同一个 tile/shape 配置（xlarge, 1024×1024×1024）本地
+RTX 5090 是 `2.478528`——真机反而更快。这只是 `--bench` 模式的一次性读数，
+没有走正式 benchmark 方法论（重复次数、统计口径都还没对齐 dcu_perf.md 的
+标准），不能当结论用，只作为后续正式 benchmark 工作的一个初步信号。
+
+**结论**：两个监控脚本（本地 `gpu_monitor.sh`、真机 `dcu_monitor.sh`）都已
+在真实负载下验证有效，往后任何真机提交想确认"核心是否被用上"，直接用
+`dcu_monitor.sh` 包一层要跑的命令即可，不需要每次重新发明验证方法。
 
 ---
 
 ## 拿到真机后的优先级建议
 
-1. 先编译一个只有 `cudaMalloc`+`check()` 的最小 `.cu` 文件（不含 kernel），
-   确认"cuda* 符号能否在 hipcc/HCC 后端直接解析"这个最根本的问题——这决定
-   了要不要采用建议 1。
-2. 确认后，三个文件套用建议 1 的兼容层，先让**编译**通过。
-3. 单独跑 `flash_attn.cu` 的 extreme 档 (4096,128)，确认 64 KiB 共享内存
-   请求在真实 LDS 预算下不会启动失败。
-4. 全部通过 `stress_test.py` 正确性验证后，再跑 `benchmark.py`，重新产出
-   DCU 版本的性能数字——**不要复用 dcu_perf.md 里 RTX5090 的具体倍数**，
-   尤其是 bank conflict 结论和 double 累加器开销这两项。
+1. ~~先编译一个只有 `cudaMalloc`+`check()` 的最小 `.cu` 文件~~ —— ✅ 已完成
+   （`test_min.cu`），确认了要采用建议 1。
+2. ~~三个文件套用建议 1 的兼容层，先让编译通过~~ —— ✅ 已完成，GEMM/Softmax/
+   FlashAttn 三个文件均编译运行成功。
+3. ~~单独跑 flash_attn.cu 的 smem_risk 边界用例，确认 64 KiB 共享内存请求
+   不会启动失败~~ —— ✅ 已完成，见上方真机验证记录（过程中发现并修复了
+   `hipFuncSetAttribute` 参数类型的编译期 bug）。
+4. ~~全部通过正确性验证（boundary/non-2^n/large 三档，GEMM/Softmax/
+   FlashAttn 共 9 个 shape）~~ —— ✅ 已完成，全部 PASS，见上方"压力测试
+   记录"。过程中发现真机门户对"单次提交文件数过多"的请求会返回 500，
+   已按算子拆分规避，并反馈给门户维护者。
+5. ~~跑 `benchmark.py`（或等效的真机计时方式），重新产出 DCU 版本的性能
+   数字~~ —— ✅ **部分完成**：`rocprof` 探测确认这台机器没装（DTK
+   22.10.1 这个安装里没带），改用每个 kernel 自带的 `--bench` 模式
+   （`hipEventElapsedTime`）+ 新增的 `kernels/common/dcu_monitor.sh`
+   （`rocm-smi` 后台采样，确认核心真的在跑），GEMM/Softmax/FlashAttn 三个
+   算子的真机数字已经拿到，详见 dcu_perf.md 第 7 节。**注意范围**：这只是
+   完整 kernel 的整体耗时对比，bank conflict（BN=64 vs BN=32）和 double
+   累加器（double vs float 累加器）这两项需要的是隔离 A/B 对比实验，还
+   没有做，dcu_perf.md 第 7 节里写清楚了不要把这轮结果误读成已经解决这两条。
+6. ~~补跑 flash_attn.cu 真正的 extreme 档 (seq_len=4096, head_dim=128) 和
+   GEMM 的 extreme 档 (4096,4096,4096)，覆盖 smem_risk/large 未测到的
+   网格规模、显存维度~~ —— **GEMM 部分已完成**：数值正确性 bit-for-bit
+   通过（见上方"仍待验证"清单更新）。**FlashAttn 部分也已完成**：
+   (4096,128) 用 `generate_test_data.py` 生成的真实随机 Q/K/V（约
+   6MiB，未用 GEMM extreme 那种 tile 平铺技巧）验证，真机输出
+   `O[row=0, 0:8] = 0.500090 0.495556 0.494584 0.498032 0.500829
+   0.504050 0.496310 0.503762`，与本地 CUDA 运行**逐位一致**，与参考值
+   差异约 1e-6，远低于 atol=1e-3。GEMM 和 FlashAttn 的 extreme 档数值
+   正确性均已验证完毕。

@@ -1,0 +1,10 @@
+M=100 N=300
+Reference (torch.nn.functional.softmax(X, dim=1)):
+Y[row=0, 0:8] = 0.004824 0.004985 0.002928 0.005210 0.002950 0.003641 0.002580 0.004415
+
+Run on target machine:
+  ./softmax 100 300 X.bin Y_out.bin
+Compare its stdout line (same "Y[row=0, 0:N] = ..." format) against the
+reference line above. atol=1e-5 per project validation standard
+(kernel does the standard row-max-subtracted exp/sum in float32,
+same numerical approach as this reference).

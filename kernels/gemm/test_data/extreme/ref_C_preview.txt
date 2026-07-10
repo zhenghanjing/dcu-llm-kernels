@@ -1,0 +1,10 @@
+M=4096 K=4096 N=4096 (tiled 64x64 random pattern, not fully random)
+Reference (FP64-accumulated, torch.mm(A.double(), B.double()).float()):
+C[0:8] = 1174.277710 1148.628052 1191.560425 1182.812256 1101.056396 1127.069702 1132.155151 1118.189697
+
+Run on target machine:
+  ./gemm 4096 4096 4096 A.bin B.bin
+Compare its stdout line (same "C[0:N] = ..." format) against the
+reference line above. atol=1e-5 per project validation standard
+(should match near-exactly, or even bit-for-bit, given gemm.cu's
+double accumulator).

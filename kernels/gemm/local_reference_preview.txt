@@ -1,0 +1,36 @@
+=== gemm_large_tile --tile=small boundary (M=1 K=1 N=1) ===
+gemm_large_tile: tile=small dynamic_smem=8192 bytes (8.0 KiB)
+C[0:1] = 0.807280
+=== gemm_large_tile --tile=small non-2^n (M=100 K=300 N=200) ===
+gemm_large_tile: tile=small dynamic_smem=8192 bytes (8.0 KiB)
+C[0:8] = 73.222260 67.406136 64.838776 69.683899 72.360916 74.046577 69.190125 73.181534
+=== gemm_large_tile --tile=small large (M=256 K=256 N=256) ===
+gemm_large_tile: tile=small dynamic_smem=8192 bytes (8.0 KiB)
+C[0:8] = 61.034290 64.137817 60.134647 56.624046 60.524803 61.831390 58.626888 58.881058
+=== gemm_large_tile --tile=medium boundary (M=1 K=1 N=1) ===
+gemm_large_tile: tile=medium dynamic_smem=24576 bytes (24.0 KiB)
+C[0:1] = 0.807280
+=== gemm_large_tile --tile=medium non-2^n (M=100 K=300 N=200) ===
+gemm_large_tile: tile=medium dynamic_smem=24576 bytes (24.0 KiB)
+C[0:8] = 73.222260 67.406136 64.838776 69.683899 72.360916 74.046577 69.190125 73.181534
+=== gemm_large_tile --tile=medium large (M=256 K=256 N=256) ===
+gemm_large_tile: tile=medium dynamic_smem=24576 bytes (24.0 KiB)
+C[0:8] = 61.034290 64.137817 60.134647 56.624046 60.524803 61.831390 58.626888 58.881058
+=== gemm_large_tile --tile=large boundary (M=1 K=1 N=1) ===
+gemm_large_tile: tile=large dynamic_smem=40960 bytes (40.0 KiB)
+C[0:1] = 0.807280
+=== gemm_large_tile --tile=large non-2^n (M=100 K=300 N=200) ===
+gemm_large_tile: tile=large dynamic_smem=40960 bytes (40.0 KiB)
+C[0:8] = 73.222260 67.406136 64.838776 69.683899 72.360916 74.046577 69.190125 73.181534
+=== gemm_large_tile --tile=large large (M=256 K=256 N=256) ===
+gemm_large_tile: tile=large dynamic_smem=40960 bytes (40.0 KiB)
+C[0:8] = 61.034290 64.137817 60.134647 56.624046 60.524803 61.831390 58.626888 58.881058
+=== gemm_large_tile --tile=xlarge boundary (M=1 K=1 N=1) ===
+gemm_large_tile: tile=xlarge dynamic_smem=65536 bytes (64.0 KiB)
+C[0:1] = 0.807280
+=== gemm_large_tile --tile=xlarge non-2^n (M=100 K=300 N=200) ===
+gemm_large_tile: tile=xlarge dynamic_smem=65536 bytes (64.0 KiB)
+C[0:8] = 73.222260 67.406136 64.838776 69.683899 72.360916 74.046577 69.190125 73.181534
+=== gemm_large_tile --tile=xlarge large (M=256 K=256 N=256) ===
+gemm_large_tile: tile=xlarge dynamic_smem=65536 bytes (64.0 KiB)
+C[0:8] = 61.034290 64.137817 60.134647 56.624046 60.524803 61.831390 58.626888 58.881058

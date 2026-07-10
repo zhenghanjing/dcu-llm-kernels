@@ -10,7 +10,7 @@ DCU 采用 ROCm/HIP 生态，与 CUDA 编程模型相近但存在关键差异（
 
 ## 当前进度
 
-三个核心算子均已成功生成、编译、在 GPU 上运行，并通过 PyTorch 基线的数值精度验证：
+三个核心算子均已成功生成、编译、在 GPU 上运行，并通过 PyTorch 基线的数值精度验证（NVIDIA RTX 5090 / CUDA）：
 
 | 算子 | 实现要点 | 编译 | 运行 | 精度验证 | 最大绝对误差 |
 |------|----------|------|------|----------|--------------|
@@ -19,6 +19,20 @@ DCU 采用 ROCm/HIP 生态，与 CUDA 编程模型相近但存在关键差异（
 | Flash Attention | 分块 + online softmax | ✅ | ✅ | PASS | 6.56e-07 |
 
 > GEMM 与 Softmax 采用 FP32 容差 `atol=1e-5`；Flash Attention 因分块改变浮点累加顺序，采用 `atol=1e-3`。
+
+三个算子均已进一步在海光 **DCU 真机**（gfx906/gfx926，DTK 22.10.1，`hipcc` 编译）验证编译与运行正确性：
+
+| 算子 | 真机编译 | 真机运行 | 输出对比本地 CUDA |
+|------|----------|----------|--------------------|
+| GEMM | ✅ | ✅ exit 0 | **bit-for-bit 一致** |
+| Softmax | ✅ | ✅ exit 0 | 逐位一致 |
+| Flash Attention | ✅（含 smem_risk 用例，64KiB 动态共享内存，触发 `hipFuncSetAttribute`） | ✅ exit 0，两用例均无 launch failure | 一致（1e-6 量级浮点舍入内） |
+
+真机验证过程中发现并修复了两个真实的可移植性问题（而非"直接跑通"）：`cuda*` 符号在 hipcc 下不会隐式可用（需要显式 include + 手写符号映射），以及 `cudaFuncSetAttribute`/`hipFuncSetAttribute` 的核函数指针参数在 hipcc 的 Clang 前端下不能隐式转换为 `const void*`（需要显式 cast，nvcc/MSVC 此前放行了这个非标准写法）。详见 `docs/dcu_portability_review.md`。
+
+新增的 `kernels/gemm/gemm_large_tile.cu`（GEMM 的动态共享内存变体，运行时可选 tile 配置，最大档需要 64KiB 动态共享内存）进一步在真机验证了上述两个可移植性修复方案能否被复用到一个全新写的 kernel：**首次 `hipcc` 编译即一次性成功**，4 个 tile 配置 × 3 个 shape 共 12 组测试全部 bit-for-bit 通过，证明 `.claude/skills/dcu_hip_porting.md` 里沉淀的经验具备跨 kernel 复用能力，而不只对 `flash_attn.cu` 这一个文件有效。详见 `docs/dcu_portability_review.md`"真机验证记录"一节。
+
+真机这一轮只验证了**正确性**，尚未产出 DCU 版本的性能数字，也还没跑完整的 `stress_test.py` 压力测试套件（目前是手工验证单个/两个 shape）；bank conflict、`double` 累加器开销等 `dcu_perf.md` 里基于 RTX 5090 标定的性能结论也都还没有在真机上重新验证。
 
 ## 目录结构
 
@@ -90,4 +104,6 @@ python kernels/flash_attention/validate_flash_attn.py 128 64
 
 ## 关于 DCU 硬件
 
-当前在 NVIDIA 平台完成的工作约占项目整体 75%。剩余约 25% 为 DCU 硬件专属内容，包括 `hipcc` 针对 gfx906 的编译、`rocprof` 性能剖析、`warpSize=64` 的实机行为验证。由于代码已通过 HIP 条件编译保证可移植性，这部分工作在获得 DCU 机器后可快速补全。
+已获得海光 DCU 真机访问（gfx906/gfx926，DTK 22.10.1），三个算子的 `hipcc` 编译与运行正确性均已验证通过（见上方"当前进度"表格与 `docs/dcu_portability_review.md`"真机验证记录"）。
+
+尚未完成的 DCU 硬件专属工作：`rocprof` 性能剖析、`warpSize=64` 下 bank conflict 等性能结论的实机重新验证、完整 `stress_test.py`/`benchmark.py` 套件在真机上的运行，以及 flash_attn.cu 真正的 extreme 档（seq_len=4096, head_dim=128）压力测试。

@@ -2,7 +2,11 @@
 validate_gemm.py — compare gemm kernel output against PyTorch reference.
 
 Usage:
-    python validate_gemm.py <M> <K> <N>
+    python validate_gemm.py <M> <K> <N> [binary_path]
+
+    binary_path : optional path to the compiled gemm binary. Defaults to
+                  the hardcoded BINARY path (kernels/gemm/gemm[.exe]) when
+                  omitted, so existing call sites keep working unchanged.
 
 Flow:
   1. Generate A[M,K] and B[K,N] in Python (torch, seed=42).
@@ -26,11 +30,12 @@ _base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemm")
 BINARY = _base + ".exe" if sys.platform == "win32" else _base
 
 
-def run_binary(M: int, K: int, N: int, A: torch.Tensor, B: torch.Tensor):
+def run_binary(M: int, K: int, N: int, A: torch.Tensor, B: torch.Tensor,
+               binary: str = BINARY):
     """Write A, B to temp files, invoke the kernel, return parsed C values."""
-    if not os.path.isfile(BINARY):
+    if not os.path.isfile(binary):
         raise FileNotFoundError(
-            f"Binary '{BINARY}' not found. "
+            f"Binary '{binary}' not found. "
             f"Compile first:  nvcc -O2 -o {_base} {_base}.cu"
         )
 
@@ -43,7 +48,7 @@ def run_binary(M: int, K: int, N: int, A: torch.Tensor, B: torch.Tensor):
         B.numpy().astype(np.float32).tofile(path_b)
 
         result = subprocess.run(
-            [BINARY, str(M), str(K), str(N), path_a, path_b],
+            [binary, str(M), str(K), str(N), path_a, path_b],
             capture_output=True, text=True, check=True
         )
     finally:
@@ -56,7 +61,7 @@ def run_binary(M: int, K: int, N: int, A: torch.Tensor, B: torch.Tensor):
     return [float(v) for v in values_str.split()]
 
 
-def validate(M: int, K: int, N: int):
+def validate(M: int, K: int, N: int, binary: str = BINARY):
     torch.manual_seed(42)
     A = torch.rand(M, K, dtype=torch.float32)
     B = torch.rand(K, N, dtype=torch.float32)
@@ -68,7 +73,7 @@ def validate(M: int, K: int, N: int):
     ref_values = C_ref.flatten()[:n_print]
 
     try:
-        kernel_values = run_binary(M, K, N, A, B)
+        kernel_values = run_binary(M, K, N, A, B, binary=binary)
     except FileNotFoundError as e:
         print(f"[SKIP] {e}")
         print(f"  ref C[0:{n_print}] = {ref_values.tolist()}")
@@ -88,10 +93,11 @@ def validate(M: int, K: int, N: int):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print(f"Usage: python {sys.argv[0]} <M> <K> <N>")
+    if len(sys.argv) not in (4, 5):
+        print(f"Usage: python {sys.argv[0]} <M> <K> <N> [binary_path]")
         sys.exit(1)
 
     M, K, N = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-    ok = validate(M, K, N)
+    binary = sys.argv[4] if len(sys.argv) == 5 else BINARY
+    ok = validate(M, K, N, binary=binary)
     sys.exit(0 if ok is None or ok else 1)

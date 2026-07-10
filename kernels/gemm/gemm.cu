@@ -34,7 +34,10 @@ constexpr int TILE = 16;   // kept as the K-tile depth (BK below)
 // compute:memory-access ratio (float4 loads alone, step 1, left it unchanged).
 constexpr int BK = TILE;   // K-dimension tile depth
 constexpr int BM = 64;     // output rows per block
-constexpr int BN = 64;     // output cols per block
+#ifndef GEMM_BN
+#define GEMM_BN 64
+#endif
+constexpr int BN = GEMM_BN;   // output cols per block
 constexpr int TM = 4;      // output rows per thread
 constexpr int TN = 4;      // output cols per thread
 constexpr int VEC = 4;     // vector width for float4 loads/stores (== TM == TN)
@@ -55,6 +58,8 @@ constexpr int NUM_THREADS = (BM / TM) * (BN / TN);   // 256
 //     occupancy by more than the loop-overhead savings are worth.
 //   - Net: BM=BN=64, BK=16 (this file) benchmarked best for the shapes that
 //     matter (1024^3, 4096^3), so the known bank conflict was left in place.
+//   - Now buildable with -DGEMM_BN=32 to compile the conflict-free variant
+//     for A/B comparison; DCU real-hardware results still pending.
 constexpr int A_VEC_SLOTS = (BM * BK) / VEC;
 constexpr int B_VEC_SLOTS = (BK * BN) / VEC;
 
@@ -75,7 +80,10 @@ __global__ void gemm_tiled(const float* __restrict__ A,
 
     // Accumulate in FP64: eliminates O(K·ε) rounding drift from FP32 summation.
     // Tiles in shared memory stay float32; only the running sums are promoted.
-    double acc[TM][TN];
+#ifndef GEMM_ACC_T
+#define GEMM_ACC_T double
+#endif
+    GEMM_ACC_T acc[TM][TN];
     #pragma unroll
     for (int i = 0; i < TM; ++i)
         #pragma unroll
@@ -154,7 +162,7 @@ __global__ void gemm_tiled(const float* __restrict__ A,
             for (int i = 0; i < TM; ++i)
                 #pragma unroll
                 for (int j = 0; j < TN; ++j)
-                    acc[i][j] += (double)a_frag[i] * (double)b_frag[j];
+                    acc[i][j] += (GEMM_ACC_T)a_frag[i] * (GEMM_ACC_T)b_frag[j];
         }
 
         __syncthreads();

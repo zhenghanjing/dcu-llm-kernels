@@ -1,0 +1,10 @@
+M=100 K=300 N=200
+Reference (FP64-accumulated, torch.mm(A.double(), B.double()).float()):
+C[0:8] = 73.222260 67.406136 64.838776 69.683899 72.360916 74.046577 69.190125 73.181534
+
+Run on target machine:
+  ./gemm 100 300 200 A.bin B.bin
+Compare its stdout line (same "C[0:N] = ..." format) against the
+reference line above. atol=1e-5 per project validation standard
+(should match near-exactly, or even bit-for-bit, given gemm.cu's
+double accumulator).

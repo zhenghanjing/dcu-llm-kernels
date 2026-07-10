@@ -1,0 +1,11 @@
+M=64 N=64  eps=1e-06
+Reference (x / sqrt(mean(x^2, dim=-1) + eps) * weight):
+Y[row=0, 0:8] = 0.210973 1.354437 0.578822 1.406174 0.208120 0.799540 0.034614 0.949553
+
+Run on target machine:
+  ./rmsnorm 64 64 X.bin W.bin Y_out.bin
+Compare its stdout line (same "Y[row=0, 0:N] = ..." format) against the
+reference line above. atol=1e-5 per project validation standard
+(kernel accumulates the sum-of-squares reduction in double per
+dcu_numerics.md's precision discipline, so the mismatch should be
+~1e-7, well under atol).

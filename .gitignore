@@ -10,3 +10,6 @@ __pycache__/
 # source, not meant to be tracked (rebuilt on demand, see docs/dcu_portability_review.md)
 *.zip
 test_min/
+
+# Local IDE/agent settings, not meant to be shared across machines
+.claude/settings.local.json

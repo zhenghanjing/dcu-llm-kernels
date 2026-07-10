@@ -63,6 +63,15 @@
   #define cudaEventDestroy                               hipEventDestroy
   #define cudaFuncSetAttribute                           hipFuncSetAttribute
   #define cudaFuncAttributeMaxDynamicSharedMemorySize    hipFuncAttributeMaxDynamicSharedMemorySize
+
+  // --- added for flash_attn.cu configure_smem() HIP branch (建议 2):
+  //     querying the real per-workgroup LDS limit on gfx906 instead of
+  //     reusing the CUDA-only 48KiB opt-in threshold. Same
+  //     confirmed-by-pattern status as the block above: not yet
+  //     individually re-verified on real hardware. ---
+  #define cudaGetDevice                                  hipGetDevice
+  #define cudaDeviceProp                                 hipDeviceProp_t
+  #define cudaGetDeviceProperties                        hipGetDeviceProperties
 #else
   #include <cuda_runtime.h>
 #endif

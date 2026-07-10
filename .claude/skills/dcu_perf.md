@@ -189,6 +189,132 @@ stress_test 会让"看起来没退步但其实没有变快甚至变慢"的改动
 被放弃的实验性改动（`BN=32`、`BK=32`）也是先跑完两个脚本拿到数据，再决定
 不采用。
 
+## 7. 真机 (DCU) 性能实测：三个算子的真实数字，以及哪些旧结论还没被验证
+
+**背景**：本文档第 1-6 条全部是在 RTX 5090 (nvcc) 上测出的结论。DCU 计算
+节点没有 torch，也没有 `rocprof`（探测过，`command not found`，DTK
+22.10.1 这个安装里没带），所以没法照搬 `tests/benchmark.py` 的方案，也
+拿不到 occupancy/显存带宽这类 kernel 级别的细粒度 profiling 数据。这一轮
+用的是每个 kernel 自带的 `--bench` 模式（`hipEventElapsedTime` 计时，
+warmup+iters 取中位数——GEMM/Softmax/FlashAttn/RMSNorm 四个文件都已经内置
+了这个模式，不需要额外写代码），配合新增的
+`kernels/common/dcu_monitor.sh`（后台采样 `rocm-smi`，确认 DCU 核心真的在
+跑，不是"进程退出码 0"这种弱证据——用法和踩过的坑见
+`docs/dcu_portability_review.md`"资源利用率监控"一节）。
+
+**GEMM**（shape 与本文档第 1-5 条的 RTX 5090 基线完全对齐）：
+
+| shape | RTX 5090 (nvcc) | DCU 真机 | 倍率 |
+|---|---|---|---|
+| (100,300,200) | 0.38 ms | 0.114 ms | 快 ~3.3x |
+| (1024,1024,1024) | 2.55 ms | 0.789 ms | 快 ~3.2x |
+| (4096,4096,4096) | 129 ms | 43.15 ms | 快 ~3.0x |
+
+三个 shape 一致地快约 3 倍，extreme 档 `dcu_monitor.sh` 确认 `card1`
+利用率 avg 71.1%、max 100%，不是"跑了个寂寞"。
+
+**Softmax**（本文档之前没有为 Softmax 建过 RTX 5090 的 ms 基线，这里只有
+DCU 侧的绝对数字，没有倍率可比）：
+
+| shape | DCU 真机 |
+|---|---|
+| (100,300) | 0.017 ms |
+| (128,1024) | 0.019 ms |
+
+单次 kernel 耗时在微秒级，60 次 warmup+iters 总共只有约 1ms，`rocm-smi`
+每次调用本身的进程开销（约 1 秒级）根本来不及采到一个样本——
+`dcu_monitor.sh` 如实报了"0 samples captured"的警告，而不是印一个引起误解
+的 `0%`，这是符合设计的正确行为，不是新 bug。
+
+**FlashAttn**（shape 同样对齐本文档第 5 条的 grid 分析表；同样没有 RTX
+5090 的 ms 基线可比）：
+
+| shape (seq_len,head_dim) | DCU 真机 |
+|---|---|
+| (100,64) | 3.87 ms |
+| (512,64) | 18.07 ms |
+| (4096,128) | 276.97 ms |
+
+**(4096,128) 是这次的重点**：这是 `docs/dcu_portability_review.md` 里标注
+的真正 extreme 档，此前只验证过它 64KiB 共享内存这一个边界点（用
+`smem_risk` 这个更小的替代 shape (128,128)），网格规模、显存访问量这些
+维度从没有在真机上完整跑过。这次是第一次端到端跑通——编译、执行、计时
+全部成功，`dcu_monitor.sh` 全程 36 个采样点 `avg_use=100.0%`、
+`max_use=100%`，没有一个样本掉下来，说明这个 shape 在真机上不存在网格
+规模不足或显存问题，`docs/dcu_portability_review.md`"仍待验证"清单里这一
+条现在可以标记为已验证。
+
+**这一轮遗留了两条"必须重测，不能沿用 RTX5090 结论"的待办——`double` 累加器
+的相对开销、bank conflict 在 wavefront=64 下的实际表现——都已在后续一轮
+真机隔离 A/B 实验中补齐，不再是间接证据。完整数据、方法和结论见下面
+第 8 节。**
+
+## 8. Bank conflict / 累加器隔离 A/B：真机 (DCU) 完整数据
+
+**背景**：第 7 节末尾记录的两个待办——bank conflict 在 wavefront=64 下的
+实际表现、`double` 累加器的相对性能开销——这一轮补齐，用真机上独立编译的
+对照二进制做隔离 A/B，而不是像第 7 节那样只看"整体 kernel 更快"这种
+间接证据。
+
+**参数化做法**：`gemm.cu` 新增两个编译期宏，默认值与重构前完全一致：
+
+- `GEMM_BN`（默认 64）：控制 `BN`（tile 列宽），`-DGEMM_BN=32` 编译出
+  bank-conflict-free 对照版本。
+- `GEMM_ACC_T`（默认 double）：控制内积累加器类型，`-DGEMM_ACC_T=float`
+  编译出 float 累加器对照版本。
+
+不加任何 `-D` 编译出的默认二进制与重构前逐位一致——已用
+`tests/stress_test.py --skip-compile` 验证 10/10 PASS，GEMM 各档误差仍为
+`0.00e+00`，确认参数化本身没有引入任何行为变化。
+
+**测量方法**：对 `gemm`（BN=64, double，基线）、`gemm_bn32`（BN=32, double）、
+`gemm_accf`（BN=64, float）三个二进制，在 (100,300,200)/(1024³)/(4096³)
+三档 shape 上，各自独立调用 15 次 `--bench`（15 个分开的进程，不是把
+`--bench` 自身的 iters 调大），记录 15 个 `BENCH_MS` 原始值后再算均值和
+标准差——避免"单次运行"的偶然误差冒充成结论。
+
+**Bank conflict（BN=64 baseline vs BN=32 conflict-free）**：
+
+| shape | BN=64 (ms, mean±std) | BN=32 (ms, mean±std) | 差异 |
+|---|---|---|---|
+| (100,300,200) | 0.1138±0.0001 | 0.1300±0.0001 | 慢 14.2% |
+| (1024,1024,1024) | 0.7886±0.0004 | 1.0323±0.0009 | 慢 30.9% |
+| (4096,4096,4096) | 43.141±0.007 | 45.441±0.018 | 慢 5.3% |
+
+**累加器（double baseline vs float）**：
+
+| shape | double (ms, mean±std) | float (ms, mean±std) | 差异 |
+|---|---|---|---|
+| (100,300,200) | 0.1138±0.0001 | 0.0790±0.0004 | float 快 1.44x |
+| (1024,1024,1024) | 0.7886±0.0004 | 0.4593±0.0038 | float 快 1.72x |
+| (4096,4096,4096) | 43.141±0.007 | 17.904±0.012 | float 快 2.41x |
+
+**结论**：
+
+- **bank conflict**：DCU 上的方向和 RTX5090 相反——RTX5090 上消除冲突
+  （BN=32）只在小尺寸更快（快 45%），大/超大尺寸反而变慢；DCU 上消除
+  冲突在**全部三档**都更慢（14.2%/30.9%/5.3%），没有任何尺寸受益。当前
+  默认 `BN=64`（保留理论 bank conflict）在 DCU 上依然是正确选择，不需要改。
+- **累加器**：float 累加器的性能优势已量化，且随规模增大而扩大（1.44x →
+  1.72x → 2.41x，extreme 档差距最大）。但 float 累加器本身在本地 RTX5090
+  上已经测出不满足 `atol=1e-5`（K=8192 时 max error 1.12e-02，见
+  `dcu_numerics.md`）——这是算法层面的精度问题，和平台无关，DCU 上不会
+  变好。因此这 1.44~2.41x 的开销是保证正确性必须付出的代价，不采纳切换
+  成 float。
+
+**`dcu_monitor.sh` 复测**：extreme 档三个变体（`gemm`/`gemm_bn32`/
+`gemm_accf`）`max_use` 全部 100%，确认三次都是真实计算负载，不是"进程
+退出码 0"这种弱证据。`gemm_accf` 的 `avg_use`（33.0%）明显低于另外两个
+变体，但这不代表利用率真的低——是因为它总耗时短（~18ms vs baseline
+~43ms/BN32 ~45ms），`rocm-smi` 采样点集中在进程启动/收尾的空档，和第 7
+节记录的 Softmax"耗时太短、采样被稀释"是同一类现象，不是新问题。
+
+**参考实现**：
+- 参数化实现：[kernels/gemm/gemm.cu](../../kernels/gemm/gemm.cu)
+  （`GEMM_BN`/`GEMM_ACC_T` 宏）
+- A/B 数据采集脚本：
+  [kernels/gemm/run_gemm_ab_bench.sh](../../kernels/gemm/run_gemm_ab_bench.sh)
+
 ## 参考实现
 
 - GEMM 三轮优化后的最终实现（复用受限案例）：

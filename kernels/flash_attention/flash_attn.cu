@@ -200,14 +200,45 @@ static void check(cudaError_t err, const char* msg)
 // Dynamic shared memory above 48 KiB requires an explicit opt-in per kernel
 // (true on all compute capability 7.0+ devices); without it, the launch
 // silently fails and every thread block does nothing.
+//
+// DCU (gfx906) has no NVIDIA-style "48KiB default + opt-in" two-tier model --
+// LDS is a single fixed budget per workgroup (64 KiB on gfx906). The 48*1024
+// threshold below is therefore CUDA-specific and meaningless on the HIP path
+// (see docs/dcu_portability_review.md, "建议 2" -- this branch was flagged
+// high-risk/untested until now). On HIP we instead always query the real
+// device limit via hipGetDeviceProperties().sharedMemPerBlock, fail loudly
+// with a clear message if the requested shape doesn't fit (e.g. the extreme
+// shape seq_len=4096/head_dim=128 needs exactly 64 KiB -- right at the
+// gfx906 ceiling, no headroom), and always call cudaFuncSetAttribute
+// (mapped to hipFuncSetAttribute via gpu_compat.h) rather than gating it
+// behind the 48KiB CUDA threshold.
 static void configure_smem(size_t smem_bytes)
 {
+#ifdef __HIPCC__
+    int device = 0;
+    check(cudaGetDevice(&device), "get device");
+    cudaDeviceProp prop{};
+    check(cudaGetDeviceProperties(&prop, device), "get device properties");
+    if (smem_bytes > (size_t)prop.sharedMemPerBlock) {
+        fprintf(stderr,
+                "flash_attn: requested dynamic shared memory %zu bytes "
+                "exceeds device limit %zu bytes (LDS per workgroup on this "
+                "DCU) -- reduce BLOCK_SIZE or head_dim for this shape\n",
+                smem_bytes, prop.sharedMemPerBlock);
+        exit(1);
+    }
+    check(cudaFuncSetAttribute((const void*)flash_attn_kernel,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int)smem_bytes),
+          "set max dynamic shared memory");
+#else
     if (smem_bytes > 48 * 1024) {
-        check(cudaFuncSetAttribute(flash_attn_kernel,
+        check(cudaFuncSetAttribute((const void*)flash_attn_kernel,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)smem_bytes),
               "set max dynamic shared memory");
     }
+#endif
 }
 
 static float* read_binary(const char* path, size_t n)

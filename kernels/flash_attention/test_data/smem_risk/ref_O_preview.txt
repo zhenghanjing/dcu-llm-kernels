@@ -1,0 +1,12 @@
+seq_len=128 head_dim=128
+Reference (explicit scaled-dot-product-attention, FP32):
+O[row=0, 0:8] = 0.468841 0.505699 0.498429 0.492448 0.496843 0.519549 0.476674 0.516197
+  (cross-check vs torch SDPA max diff = 3.58e-07, expected ~0)
+
+Dynamic shared memory required: 65536 bytes (64 KiB) -- exceeds 48 KiB, cudaFuncSetAttribute WILL be called
+
+Run on target machine:
+  ./flash_attn 128 128 Q.bin K.bin V.bin O_out.bin
+Compare its stdout line (same "O[row=0, 0:N] = ..." format) against the
+reference line above. atol=1e-3 per validate_flash_attn.py (tiled online
+softmax reorders float ops relative to the naive reference).
