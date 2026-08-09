@@ -486,6 +486,160 @@ RTX 5090 是 `2.478528`——真机反而更快。这只是 `--bench` 模式的�
 
 ---
 
+## 性能对标基准探测记录：DCU 硬件参数 + rocBLAS/hipBLAS/MIOpenGEMM
+
+**动机**：项目目标升级为对标 5090 上 `torch` SOTA 性能（方法论见
+`.claude/skills/dcu_perf.md` 第 9 节），需要先搞清楚两件事：DCU 的真实
+理论峰值算力（不能靠猜），以及 DCU 上有没有可以直接拿来当"同硬件 SOTA
+对照组"的厂商优化库。这一节记录探测过程和原始输出要点，供后续复核。
+
+**探测 1：`kernels/common/lib_probe/run_lib_probe.sh`（硬件参数 + rocBLAS/hipBLAS）**
+
+真机 `rocminfo` 完整输出确认了 DCU Agent 的关键参数：
+
+```
+Name: ZIFANG   Marketing Name: Device 66a1   Vendor: HYGON
+Compute Unit: 64   SIMDs per CU: 4   Shader Engines: 4
+Wavefront Size: 64   Max Clock Freq. (MHz): 1700
+ISA: amdgcn-amd-amdhsa--gfx906:sramecc-:xnack-
+```
+
+`rocm-smi --showproductname` 确认卡型号：`Card vendor: Pre-Wukong DCU`，
+`Card SKU: D160A1`。`hipcc --version` 确认工具链：`HIP version:
+5.2.23066-47359852`，clang 14.0.0，`InstalledDir: /public/software/
+compiler/dtk/dtk-22.10.1/llvm/bin`。
+
+按 GCN 架构惯例（每 CU = 4×SIMD16 = 64 个 FP32 ALU）算理论峰值：
+
+```
+FP32 峰值 = 64 CU × 64 ALU/CU × 2(FMA) × 1.7GHz ≈ 13.9 TFLOPS
+FP64 峰值(gfx906 1:2 比例) ≈ 6.96 TFLOPS
+FP16(packed) 峰值 ≈ 27.8 TFLOPS
+```
+
+用同架构 MI60 的公开数据（64CU/1.8GHz/官方标称 FP32=14.7 TFLOPS）反推
+同一公式验证过，误差在预期范围内，算法可信。此前凭"FP64≈10TFLOPS"倒推的
+"~20 TFLOPS"估算是错的、偏高，已作废，后续一律用这次真机实测的 13.9
+TFLOPS。
+
+rocBLAS/hipBLAS 库探测：
+
+```
+ldconfig -p | grep -iE "rocblas|hipblas|miopen"
+  librocblas.so / librocblas.so.0        -> /opt/rocm/lib/
+  libhipblas.so / libhipblas.so.0        -> /opt/rocm/lib/
+  libmiopengemm.so, libMIOpen.so(.1)     -> /opt/rocm/lib/
+find /opt/rocm* -iname "*rocblas*" -o -iname "*hipblas*"
+  头文件都在: /opt/rocm/include/rocblas.h, /opt/rocm/include/hipblas.h
+  （以及 /opt/rocm/rocblas/、/opt/rocm/hipblas/ 下的等价副本）
+```
+
+最小链接+运行测试（`hipblasCreate()`/`rocblas_create_handle()`）均编译
+成功、运行返回 `status=0`：
+
+```
+=== 最小 hipBLAS 链接+运行测试 ===
+compile exit: 0
+hipblasCreate status=0
+hipBLAS OK
+
+=== 最小 rocBLAS 链接+运行测试 ===
+compile exit: 0
+rocblas_create_handle status=0
+rocBLAS OK
+```
+
+**结论**：rocBLAS 和 hipBLAS 都真实可用（头文件、库、链接、运行全部
+确认），可以作为 DCU 侧的同硬件 SOTA 对照组，不需要"不确定/以后再说"。
+
+**探测 2：hipBLAS 是否是独立实现——查证，不是猜测**
+
+没有单独跑 hipBLAS 的 GEMM benchmark，原因是查了 ROCm 官方文档
+（hipBLAS Introduction 页面）确认它是一个 marshalling library：本身不做
+计算，只是把调用转发给后端——AMD/ROCm 平台上后端就是 rocBLAS，NVIDIA
+平台上是 cuBLAS。也就是说在这台 DCU 上 `hipblas_sgemm` 底层就是调
+`rocblas_sgemm`，单独测会得到和 rocBLAS 几乎一样的数字，属于重复劳动。
+这一条是查证结论，不是未经验证的假设。
+
+**探测 3：`kernels/common/lib_probe/run_miopengemm_probe.sh`（MIOpenGEMM 可用性）**
+
+`ldconfig` 里能看到 `libmiopengemm.so`，但探测其导出符号（`nm -D
+--defined-only libmiopengemm.so | c++filt`）发现这不是一个能直接调用的
+简单 GEMM 接口：
+
+```
+包版本: miopengemm-1.1.6.645_rocm_rel_2.9_6_6275a87-1.x86_64
+        （绑定 ROCm 2.9，2019 年发布，明显早于这台机器其余组件的
+         DTK 22.10.1）
+导出符号里的类型: MIOpenGEMM::Geometry / HyPas / Constraints /
+  ProgramCacher / TinyOne<T>::find1() / benchgemm() ...
+  以及 _cl_event / _cl_command_queue（OpenCL 类型，不是 HIP 类型）
+```
+
+也就是说要调用它，得先构造 `Geometry`/`HyPas`/`Constraints` 等一整套
+对象，再跑 `find1()` 触发一次自动调优搜索（遗传算法找最优 kernel 参数
+组合），而不是像 rocBLAS 那样一行 `rocblas_sgemm(...)` 就能拿到结果；
+而且底层还是 OpenCL 后端，要接入现有 HIP 代码得先搭一层 OpenCL
+context/queue 桥接。
+
+**结论**：MIOpenGEMM 存在，但是一个绑定旧版本 ROCm 的遗留 OpenCL 自动
+调优库，没有稳定的简单调用接口，投入产出比不划算，**不纳入 SOTA 对比
+候选**——如实记录"存在但不适用"，不强行拿它凑一个数字。
+
+**探测脚本位置**：`kernels/common/lib_probe/run_lib_probe.sh`（硬件
+参数 + rocBLAS/hipBLAS）、`kernels/common/lib_probe/run_miopengemm_probe.sh`
+（MIOpenGEMM 符号表探测）。基准数据和结论详见
+`.claude/skills/dcu_perf.md` 第 9 节。
+
+---
+
+## GEMM 自适应寄存器分块派发：真机验证记录
+
+**验证对象**：`kernels/gemm/gemm.cu` 的运行时 tile 派发实验(64×4×4 小
+tile vs 128×8×8 大 tile，按 grid 富余度选择)，完整方法论和本地(5090)
+数据见 `.claude/skills/dcu_perf.md` 第 10 节。这里只记录真机部分。
+
+**正确性**：`kernels/gemm/test_data/{boundary,non2n,large,extreme}` 四档
+（分别对应 M=K=N=1、100×300×200、256³、4096³，前三档走小 tile 分支、
+extreme 档走大 tile 分支）真机编译运行，输出与本地已验证过的参考值
+**逐位一致**：
+
+```
+boundary : C[0:1] = 0.807280
+non2n    : C[0:8] = 73.222260 67.406136 64.838776 69.683899 72.360916 74.046577 69.190125 73.181534
+large    : C[0:8] = 61.034290 64.137817 60.134647 56.624046 60.524803 61.831390 58.626888 58.881058
+extreme  : C[0:8] = 1174.277710 1148.628052 1191.560425 1182.812256 1101.056396 1127.069702 1132.155151 1118.189697
+```
+
+两条 dispatch 分支在真机上都算对了。
+
+**性能——发现负优化**：
+
+| shape | DCU 真机(小tile) | DCU 真机(128-tile 触发, 4096³) |
+|---|---|---|
+| (100,300,200) | 0.1141 ms | — |
+| (1024³) | 0.7847 ms | — |
+| (4096³) | 43.141 ms(旧基线) | **48.487 ms（慢 12.4%）** |
+
+5090 本地这个配置在 4096³ 快 12.4%，DCU 真机上反而慢 12.4%，方向完全
+相反。rocBLAS 同批次复测数字稳定（0.025121/0.229244/13.348505 ms，与
+更早一次探测的 0.023360/0.226725/13.349571 ms 基本一致，确认测量方法论
+可信，不是这次数据本身有噪声）。
+
+**处理**：默认行为已改回永远走小 tile（不传 `GEMM_ENABLE_AUTO_DISPATCH`
+宏时 `use_large_tile()` 恒返回 false），128-tile 相关代码保留但默认不
+生效。这个改动本身不需要重新提交真机——恢复的是已经在这次和更早测试里
+都验证过的小 tile 行为，等价性由已有真机数据保证。
+
+**结论**：这是本仓库第二个"5090 有效调优方向在 DCU 上相反"的独立案例
+（第一个是 bank conflict，见 dcu_perf.md 第 8 节），进一步坐实"跨平台
+性能结论不能假设可迁移，必须真机重新验证"这条方法论。DCU 上自定义
+kernel 与 rocBLAS 的效率差距（19~23% vs 68~74%）依然没有缩小，需要
+专门针对 gfx906 寄存器压力/occupancy 特性的分析才可能取得进展，留作
+后续待办。
+
+---
+
 ## 拿到真机后的优先级建议
 
 1. ~~先编译一个只有 `cudaMalloc`+`check()` 的最小 `.cu` 文件~~ —— ✅ 已完成

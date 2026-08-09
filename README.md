@@ -34,6 +34,21 @@ DCU 采用 ROCm/HIP 生态，与 CUDA 编程模型相近但存在关键差异（
 
 真机这一轮只验证了**正确性**，尚未产出 DCU 版本的性能数字，也还没跑完整的 `stress_test.py` 压力测试套件（目前是手工验证单个/两个 shape）；bank conflict、`double` 累加器开销等 `dcu_perf.md` 里基于 RTX 5090 标定的性能结论也都还没有在真机上重新验证。
 
+**后续更新**：bank conflict、`double` 累加器开销均已在真机上补齐隔离 A/B 实测（`.claude/skills/dcu_perf.md` 第 8 节），结论都是保留当前默认实现。
+
+## 性能对标 SOTA：GEMM 双口径基准（新增）
+
+项目目标进一步升级为对标 5090 上 `torch` 算子的 SOTA 性能。由于 5090 与这台真机 DCU(gfx906) 的硬件算力量级不同（5090 FP32 峰值 104.8 TFLOPS，DCU 真机实测峰值仅 ~13.9 TFLOPS，相差约 7.5 倍），绝对数字直接对比对 DCU 天然不利，因此采用**双口径**方法论：跨硬件绝对数字 + 各自硬件利用率百分比分开汇报。
+
+GEMM 已产出四条线数据（DCU 自定义 kernel、DCU rocBLAS、5090 自定义 kernel、5090 `torch.mm`(显式关闭 TF32)）：
+
+| shape | DCU 自定义 | DCU rocBLAS | 5090 自定义 | 5090 torch SOTA |
+|---|---|---|---|---|
+| (1024³) 利用率 | 19.55% | 68.00% | 0.80% | 36.58% |
+| (4096³) 利用率 | 22.87% | 73.90% | 1.02% | 63.26% |
+
+**结论**：绝对吞吐上 DCU 就算用自己最好的库(rocBLAS)也比 5090 SOTA 慢 4~6.4 倍，这是硬件峰值差距决定的，不现实作为目标；但自定义 kernel 在 DCU 上的效率(19~23%)离 DCU 自己的 rocBLAS(68~74%) 还有约 3 倍空间，这是纯软件问题，是当前明确可行的优化目标。完整数据、方法论、rocBLAS/hipBLAS/MIOpenGEMM 基准库选择依据见 `.claude/skills/dcu_perf.md` 第 9 节。
+
 ## 目录结构
 
 ```
